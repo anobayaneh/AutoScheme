@@ -197,7 +197,7 @@ function commit_and_deploy($chat) {
         say($chat, "🔁 Nag-e-redeploy ang existing service...");
     } else {
         // brand new -> create it (this also starts the first deploy automatically)
-        $name = 'bot-' . strtolower(preg_replace('/[^a-z0-9]+/i', '-', explode('/', $repo)[1]));
+        $name = $state[$chat]['name'] ?? ('bot-' . strtolower(preg_replace('/[^a-z0-9]+/i', '-', explode('/', $repo)[1])));
         [$c3, $created] = rnd('POST', '/services', [
             'type'       => 'web_service',
             'name'       => $name,
@@ -269,6 +269,87 @@ function show_logs($chat) {
 }
 
 // ============================================================
+//  MANAGE EXISTING SERVICES  (/sites)
+// ============================================================
+function list_services($chat) {
+    global $RENDER_OWNER_ID;
+    [$c, $svcs] = rnd('GET', "/services?ownerId=$RENDER_OWNER_ID&limit=100");
+    if ($c !== 200 || !is_array($svcs)) { say($chat, "❌ Hindi makuha ang services (HTTP $c)."); return; }
+
+    $rows = [];
+    foreach ($svcs as $item) {
+        $svc = $item['service'] ?? $item;
+        if (($svc['type'] ?? '') !== 'web_service') continue;
+        $rows[] = [['text' => $svc['name'], 'callback_data' => 'svc:' . $svc['id']]];
+    }
+    if (!$rows) { say($chat, "Wala kang web service sa workspace na ito."); return; }
+    say($chat, "Piliin ang site na pamamahalaan:", $rows);
+}
+
+function service_menu($chat, $sid) {
+    [, $svc] = rnd('GET', "/services/$sid");
+    $name = $svc['name'] ?? $sid;
+    $susp = ($svc['suspended'] ?? '') === 'suspended';
+    $state_label = $susp ? "⏸️ suspended (stopped)" : "▶️ active";
+    say($chat, "🗂️ <b>$name</b>\nKalagayan: $state_label\nAno ang gagawin?", [
+        [['text' => '🔄 Status', 'callback_data' => "act:status:$sid"],
+         ['text' => '📜 Logs',   'callback_data' => "act:logs:$sid"]],
+        [['text' => '🚀 Redeploy', 'callback_data' => "act:redeploy:$sid"],
+         ['text' => '♻️ Restart',  'callback_data' => "act:restart:$sid"]],
+        $susp
+            ? [['text' => '▶️ Resume (i-live)', 'callback_data' => "act:resume:$sid"]]
+            : [['text' => '⏸️ Stop (suspend)',  'callback_data' => "act:suspend:$sid"]],
+        [['text' => '🗑️ Delete', 'callback_data' => "act:delask:$sid"]],
+    ]);
+}
+
+function service_action($chat, $action, $sid) {
+    // point /status and /logs at this service too
+    $state = load_state();
+    $state[$chat]['service_id'] = $sid;
+    save_state($state);
+
+    if ($action === 'status')   { show_status($chat); return; }
+    if ($action === 'logs')     { show_logs($chat);   return; }
+
+    if ($action === 'redeploy') {
+        [$c] = rnd('POST', "/services/$sid/deploys", []);
+        say($chat, $c < 300 ? "🚀 Nag-redeploy na. Tingnan sa /status." : "❌ Redeploy failed (HTTP $c).");
+        return;
+    }
+    if ($action === 'restart') {
+        [$c] = rnd('POST', "/services/$sid/restart", []);
+        say($chat, $c < 300 ? "♻️ Nag-restart na." : "❌ Restart failed (HTTP $c).");
+        return;
+    }
+    if ($action === 'suspend') {
+        [$c] = rnd('POST', "/services/$sid/suspend", []);
+        say($chat, $c < 300 ? "⏸️ Na-suspend (offline na ang site)." : "❌ Suspend failed (HTTP $c).");
+        return;
+    }
+    if ($action === 'resume') {
+        [$c] = rnd('POST', "/services/$sid/resume", []);
+        say($chat, $c < 300 ? "▶️ Na-resume (babalik online)." : "❌ Resume failed (HTTP $c).");
+        return;
+    }
+    if ($action === 'delask') {
+        [, $svc] = rnd('GET', "/services/$sid");
+        $name = $svc['name'] ?? $sid;
+        say($chat, "⚠️ Sigurado ka bang buburahin ang <b>$name</b>? Hindi na ito maibabalik.", [
+            [['text' => '✅ Oo, burahin', 'callback_data' => "act:delyes:$sid"],
+             ['text' => '❌ Huwag',       'callback_data' => "act:delno:$sid"]],
+        ]);
+        return;
+    }
+    if ($action === 'delyes') {
+        [$c] = rnd('DELETE', "/services/$sid");
+        say($chat, $c < 300 ? "🗑️ Nabura na ang service." : "❌ Delete failed (HTTP $c).");
+        return;
+    }
+    if ($action === 'delno') { say($chat, "Okay, hindi binura."); return; }
+}
+
+// ============================================================
 //  WEBHOOK ENTRYPOINT
 // ============================================================
 $update = json_decode(file_get_contents('php://input'), true);
@@ -291,13 +372,22 @@ if ((string)$chat !== (string)$ADMIN_CHAT_ID) { http_response_code(200); echo 'o
 if ($cbData !== null) {
     if ($cbData === 'status') { show_status($chat); }
     elseif ($cbData === 'logs') { show_logs($chat); }
+    elseif (strpos($cbData, 'svc:') === 0) {
+        service_menu($chat, substr($cbData, 4));
+    }
+    elseif (strpos($cbData, 'act:') === 0) {
+        // format: act:<action>:<serviceId>
+        $parts = explode(':', $cbData, 3);
+        service_action($chat, $parts[1], $parts[2] ?? '');
+    }
     elseif (strpos($cbData, 'repo:') === 0) {
         $i = (int)substr($cbData, 5);
         $state = load_state();
         $picked = $state[$chat]['repos'][$i] ?? null;
         if ($picked) {
+            $suggested = strtolower(preg_replace('/[^a-z0-9]+/i', '-', explode('/', $picked['full'])[1]));
             $state[$chat] = [
-                'step'      => 'collect',
+                'step'      => 'name',
                 'repo'      => $picked['full'],
                 'branch'    => $picked['branch'],
                 'field_idx' => 0,
@@ -305,7 +395,7 @@ if ($cbData !== null) {
             ];
             save_state($state);
             say($chat, "Napili: <b>{$picked['full']}</b> (branch: {$picked['branch']})");
-            ask_next_field($chat);
+            say($chat, "🏷️ <b>Pangalan ng web service</b>\nKailangang unique — hindi pwedeng kapareho ng dati.\nI-type ang pangalan, o <code>skip</code> para gamitin: <code>$suggested</code>");
         }
     }
     http_response_code(200); echo 'ok'; exit;
@@ -316,13 +406,41 @@ $state = load_state();
 $step  = $state[$chat]['step'] ?? 'idle';
 
 if ($text === '/start') {
-    say($chat, "Kumusta! Gamitin ang <code>/newhost</code> para mag-deploy ng bagong host.");
+    say($chat, "Kumusta! Mga command:\n<code>/newhost</code> — mag-deploy ng bagong host\n<code>/sites</code> — pamahalaan ang mga site (status, redeploy, restart, stop, delete)\n<code>/status</code> — status ng huling deploy\n<code>/logs</code> — logs ng huling site");
 } elseif ($text === '/newhost') {
     list_repos($chat);
+} elseif ($text === '/sites') {
+    list_services($chat);
 } elseif ($text === '/status') {
     show_status($chat);
 } elseif ($text === '/logs') {
     show_logs($chat);
+} elseif ($step === 'name') {
+    global $RENDER_OWNER_ID;
+    // decide the name
+    if (strtolower($text) === 'skip' || $text === '') {
+        $name = strtolower(preg_replace('/[^a-z0-9]+/i', '-', explode('/', $state[$chat]['repo'])[1]));
+    } else {
+        $name = strtolower(preg_replace('/[^a-z0-9-]+/', '-', trim($text)));
+    }
+    // check the name isn't already taken in this workspace
+    [, $svcs] = rnd('GET', "/services?ownerId=$RENDER_OWNER_ID&limit=100");
+    $taken = false;
+    if (is_array($svcs)) {
+        foreach ($svcs as $item) {
+            $svc = $item['service'] ?? $item;
+            if (strtolower($svc['name'] ?? '') === $name) { $taken = true; break; }
+        }
+    }
+    if ($taken) {
+        say($chat, "⚠️ May service na pangalang <code>$name</code>. Mag-type ng ibang pangalan.");
+    } else {
+        $state[$chat]['name'] = $name;
+        $state[$chat]['step'] = 'collect';
+        save_state($state);
+        say($chat, "🏷️ Pangalan: <b>$name</b>");
+        ask_next_field($chat);
+    }
 } elseif ($step === 'collect') {
     // we're collecting config.php values
     global $CONFIG_FIELDS;
