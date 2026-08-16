@@ -1,7 +1,7 @@
 <?php
 /**
  * ╔══════════════════════════════════════════════════════════════════════╗
- * ║  TELEGRAM → GITHUB → RENDER DEPLOY BOT   (v5 — multi-account Render)  ║
+ * ║  TELEGRAM → GITHUB → RENDER DEPLOY BOT   (v6 — multi-account, clean)  ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  *
  *  HOW IT WORKS
@@ -12,30 +12,36 @@
  *          ├── copy → AveaBeauty-Zae   → own config.php → Render service #1
  *          └── copy → AveaBeauty-Mika  → own config.php → Render service #2
  *
- *  MULTIPLE RENDER ACCOUNTS
- *  You can plug in more than one Render account (handy once a free plan
- *  hits its limit). Set RENDER_ACCOUNTS as a JSON array:
+ *  RENDER ACCOUNTS
+ *  Add as many Render accounts as you want via the RENDER_ACCOUNTS
+ *  environment variable — a JSON array, set once in Render's dashboard:
  *
  *    RENDER_ACCOUNTS = [
- *      {"name":"Main",  "key":"rnd_xxx", "owner_id":"tea-aaa"},
- *      {"name":"Backup","key":"rnd_yyy", "owner_id":"tea-bbb"}
+ *      {"name":"Main",   "key":"rnd_xxxxxxxxxxxxx"},
+ *      {"name":"Backup", "key":"rnd_yyyyyyyyyyyyy"}
  *    ]
+ *
+ *  Only "key" is required — the bot looks up each account's owner ID and
+ *  email from Render automatically. Add more accounts anytime by editing
+ *  this one variable and saving (Render redeploys, then they show up in
+ *  the bot immediately). No in-chat add/remove — this env var is the
+ *  single source of truth, so what you see in Telegram always matches
+ *  what's actually configured.
  *
  *  Everywhere you view or manage sites you first pick which account to
  *  look at (or "🌐 All accounts" to see everything at once). When
- *  deploying a new site you can also choose "🎲 Auto" — the bot tries
- *  your accounts in order and automatically moves to the next one if the
- *  current one refuses the new service (e.g. plan/service limit hit).
+ *  deploying a new site, 🎲 Auto is the default — it rotates across your
+ *  accounts, and the moment Render itself reports the current one is
+ *  full it silently moves to the next.
  *
  *  If RENDER_ACCOUNTS isn't set, the bot falls back to the old single
- *  RENDER_API_KEY / RENDER_OWNER_ID env vars as "Account 1", so nothing
- *  breaks for existing setups.
+ *  RENDER_API_KEY / RENDER_OWNER_ID env vars as "Account 1".
  *
  *  COMMANDS
  *    /start /menu → main menu           /status → latest deploy state
  *    /newhost     → deployment wizard   /logs   → recent log lines
  *    /sites       → manage live sites   /check  → test API connections
- *    /repos       → list bot-made repos /accounts → manage Render accounts
+ *    /repos       → list bot-made repos /accounts → your Render accounts
  *    /cancel      → abort the wizard    /help   → how this works
  *
  *  All secrets live in Render environment variables. Nothing is hardcoded.
@@ -59,46 +65,12 @@ $DEFAULT_PRIVATE = getenv('CLONE_PRIVATE') === null ? true : (getenv('CLONE_PRIV
 $PAGE_SIZE      = 8;     // buttons per page
 $MAX_COPY_FILES = 300;   // ceiling for the fallback copy method
 
-/** Manually-added Render accounts (via /addaccount) live in the state file. */
-function stored_accounts() {
-    global $STATE_FILE;
-    $s = file_exists($STATE_FILE) ? (json_decode(file_get_contents($STATE_FILE), true) ?: []) : [];
-    return $s['_accounts'] ?? [];
-}
-function save_stored_accounts($list) {
-    global $STATE_FILE;
-    $s = file_exists($STATE_FILE) ? (json_decode(file_get_contents($STATE_FILE), true) ?: []) : [];
-    $s['_accounts'] = array_values($list);
-    file_put_contents($STATE_FILE, json_encode($s));
-}
-function add_stored_account($acc) { $list = stored_accounts(); $list[] = $acc; save_stored_accounts($list); }
-function remove_stored_account_at($i) {
-    $list = stored_accounts();
-    if (!isset($list[$i])) return false;
-    array_splice($list, $i, 1);
-    save_stored_accounts($list);
-    return true;
-}
-
 /**
- * Render accounts this bot can deploy to / manage.
- *
- * Two ways to add accounts:
- *
- *  1. Environment variable — RENDER_ACCOUNTS as a JSON array, set once
- *     in Render's dashboard:
- *       [{"name":"Main","key":"rnd_xxx","owner_id":"tea-aaa"}, ...]
- *     "owner_id" is optional here — if you leave it out the bot looks
- *     it up automatically from the key the first time it's used.
- *
- *  2. In-chat — send /addaccount and just paste the API key. The bot
- *     calls Render to find the owner ID and the account's email for
- *     you, asks for a short label, and saves it. No redeploy needed.
- *     Remove one anytime with /removeaccount.
- *
- * No per-account "limit" here on purpose — Render enforces its own
- * plan limits, and the bot already rotates to the next account
- * automatically the moment an account's own limit response comes back.
+ * Render accounts this bot can deploy to / manage — see the header
+ * comment above for the RENDER_ACCOUNTS format. Missing owner_id values
+ * are filled in automatically further down, once render_owners_for_key()
+ * is available (PHP hoists top-level function declarations, so calling
+ * it before its textual definition is fine).
  */
 $RENDER_ACCOUNTS = [];
 $rawAccounts = getenv('RENDER_ACCOUNTS');
@@ -111,7 +83,7 @@ if ($rawAccounts) {
             if ($key === '') continue;
             $RENDER_ACCOUNTS[] = [
                 'name' => $a['name'] ?? ('Account ' . ($i + 1)),
-                'key' => $key, 'owner_id' => $oid, 'email' => $a['email'] ?? '', 'origin' => 'env',
+                'key' => $key, 'owner_id' => $oid, 'email' => $a['email'] ?? '',
             ];
         }
     }
@@ -119,15 +91,8 @@ if ($rawAccounts) {
 if (!$RENDER_ACCOUNTS) {
     $fk = getenv('RENDER_API_KEY');
     $fo = getenv('RENDER_OWNER_ID');
-    if ($fk) $RENDER_ACCOUNTS[] = ['name' => 'Account 1', 'key' => $fk, 'owner_id' => $fo ?: '', 'email' => '', 'origin' => 'env'];
+    if ($fk) $RENDER_ACCOUNTS[] = ['name' => 'Account 1', 'key' => $fk, 'owner_id' => $fo ?: '', 'email' => ''];
 }
-// Accounts added in-chat via /addaccount live in the state file, so they
-// survive restarts without touching environment variables at all.
-foreach (stored_accounts() as $a) { $a['origin'] = 'manual'; $RENDER_ACCOUNTS[] = $a; }
-// Fill in any missing owner_id (e.g. RENDER_ACCOUNTS set without one) by
-// asking Render directly. render_owners_for_key()/http() are declared
-// further below, but PHP hoists top-level function declarations, so
-// calling them here at script start works fine.
 foreach ($RENDER_ACCOUNTS as $i => $a) {
     if (!empty($a['owner_id'])) continue;
     [, $owners] = render_owners_for_key($a['key']);
@@ -277,7 +242,8 @@ function bar($done, $total) {
 }
 
 function kb_main() {
-    return [
+    global $RENDER_ACCOUNTS;
+    $rows = [
         [['text' => '🚀 New deployment', 'callback_data' => 'nav:newhost']],
         [['text' => '🗂 My sites', 'callback_data' => 'nav:sites'],
          ['text' => '📦 My repos', 'callback_data' => 'nav:repos']],
@@ -287,13 +253,7 @@ function kb_main() {
         [['text' => '🩺 Connection check', 'callback_data' => 'nav:check'],
          ['text' => '❓ Help', 'callback_data' => 'nav:help']],
     ];
-}
-function kb_main_no_accounts() {
-    // Shown when zero Render accounts are connected yet.
-    return [
-        [['text' => '➕ Add a Render account', 'callback_data' => 'nav:addaccount']],
-        [['text' => '❓ Help', 'callback_data' => 'nav:help']],
-    ];
+    return $rows;
 }
 function kb_back() { return [[['text' => '🏠 Main menu', 'callback_data' => 'nav:menu']]]; }
 
@@ -304,7 +264,7 @@ function kb_back() { return [[['text' => '🏠 Main menu', 'callback_data' => 'n
  */
 function ensure_bot_commands() {
     $s = load_state();
-    if (!empty($s['_commands_set_v2'])) return;
+    if (!empty($s['_commands_set_v3'])) return;
 
     tg('setMyCommands', ['commands' => [
         ['command' => 'menu',     'description' => '🏠 Main menu'],
@@ -313,16 +273,14 @@ function ensure_bot_commands() {
         ['command' => 'repos',    'description' => '📦 Repos this bot has created'],
         ['command' => 'status',   'description' => '📊 Latest deploy status'],
         ['command' => 'logs',     'description' => '📜 Recent log lines'],
-        ['command' => 'accounts',      'description' => '🔀 Your Render accounts & site counts'],
-        ['command' => 'addaccount',    'description' => '➕ Connect another Render account'],
-        ['command' => 'removeaccount', 'description' => '➖ Disconnect a Render account'],
-        ['command' => 'check',         'description' => '🩺 Test GitHub & Render connections'],
-        ['command' => 'cancel',        'description' => '🛑 Abort the current wizard'],
-        ['command' => 'help',          'description' => '❓ How this bot works'],
+        ['command' => 'accounts', 'description' => '🔀 Your Render accounts & site counts'],
+        ['command' => 'check',    'description' => '🩺 Test GitHub & Render connections'],
+        ['command' => 'cancel',   'description' => '🛑 Abort the current wizard'],
+        ['command' => 'help',     'description' => '❓ How this bot works'],
     ]]);
 
     $s = load_state();
-    $s['_commands_set_v2'] = true;
+    $s['_commands_set_v3'] = true;
     save_state($s);
 }
 
@@ -349,12 +307,6 @@ function account($idx) {
 function account_name($idx) {
     $a = account($idx);
     return $a ? $a['name'] : 'Unknown account';
-}
-
-/** How many web services currently sit on this account. */
-function account_count($idx) {
-    [, $svcs] = render_services($idx);
-    return count($svcs);
 }
 
 /** Ask Render which owner(s) an API key belongs to. */
@@ -624,8 +576,9 @@ function show_menu($chat) {
             "I copy one of your GitHub repos, drop in a fresh <code>config.php</code>, " .
             "and put the copy live on Render.\n\n" .
             "⚠️ <b>No Render account connected yet.</b>\n" .
-            "Tap below and paste an API key — takes ten seconds, no redeploy needed.",
-            kb_main_no_accounts());
+            "Set <code>RENDER_ACCOUNTS</code> in this bot's Environment tab on Render, then " .
+            "send /help for the exact format.",
+            [[['text' => '❓ Help', 'callback_data' => 'nav:help']]]);
         return;
     }
 
@@ -643,7 +596,7 @@ function show_menu($chat) {
 }
 
 function show_help($chat) {
-    global $RENDER_ACCOUNTS;
+    global $RENDER_ACCOUNTS, $GITHUB_OWNER;
     $multi = count($RENDER_ACCOUNTS) > 1;
     out($chat,
         "❓ <b>How this bot works</b>\n" . rule() . "\n\n" .
@@ -660,20 +613,19 @@ function show_help($chat) {
                 : "3️⃣ Answer the config questions one at a time\n4️⃣ Review everything, then confirm\n\n") .
         "Nothing is created until you tap <b>Create &amp; deploy</b> in the last step. " .
         "You can back out with ❌ Cancel at any point.\n\n" .
-        "<b>Multiple Render accounts</b>\n" .
-        "You currently have <b>" . count($RENDER_ACCOUNTS) . "</b> account(s) connected.\n\n" .
-        "🟢 <b>Easiest — add one in chat:</b> send <code>/addaccount</code> and paste the API key. " .
-        "The bot finds the owner and email itself, asks you to name it, done. No redeploy.\n\n" .
-        "⚙️ <b>Or via environment variable:</b> set <code>RENDER_ACCOUNTS</code> in Render as a JSON list:\n" .
+        "<b>Render accounts</b>\n" .
+        "You currently have <b>" . count($RENDER_ACCOUNTS) . "</b> connected. Add or remove accounts " .
+        "by editing <code>RENDER_ACCOUNTS</code> in this bot's Render → Environment tab — it's a " .
+        "JSON list:\n\n" .
         "<pre>[\n  {\"name\":\"Main\",\"key\":\"rnd_xxx\"},\n  {\"name\":\"Backup\",\"key\":\"rnd_yyy\"}\n]</pre>\n" .
-        "<code>key</code> is from Render → Account Settings → API Keys — the bot looks up the owner " .
-        "ID and email for you if you don't include them.\n\n" .
+        "Just the <code>key</code> is required (Full Access, not Read Only — from Render → Account " .
+        "Settings → API Keys). Owner ID and email are looked up automatically, no need to include them.\n\n" .
+        "Save the variable, let this bot redeploy, and every account in the list shows up here " .
+        "immediately — in <code>/accounts</code>, <code>/sites</code>, and the deploy wizard.\n\n" .
         "No \"limit\" setting on purpose — Render enforces its own plan limits. Everywhere you view " .
         "sites you pick an account first (or 🌐 All accounts to see everything together). When " .
         "deploying, 🎲 <b>Auto</b> is the default: it rotates across your accounts, and the moment " .
         "Render itself says the current one is full it silently moves to the next.\n\n" .
-        "<code>/accounts</code> — see every connected account and its email\n" .
-        "<code>/removeaccount</code> — disconnect one you added in chat\n\n" .
         "<b>Commands</b>\n" .
         "🚀 <code>/newhost</code> — start the wizard\n" .
         "🗂 <code>/sites</code> — redeploy, restart, stop or delete a site\n" .
@@ -681,8 +633,6 @@ function show_help($chat) {
         "📊 <code>/status</code> — how the latest deploy is doing\n" .
         "📜 <code>/logs</code> — last 40 log lines\n" .
         "🔀 <code>/accounts</code> — your connected Render accounts\n" .
-        "➕ <code>/addaccount</code> — connect another Render account\n" .
-        "➖ <code>/removeaccount</code> — disconnect one added in chat\n" .
         "🩺 <code>/check</code> — test the GitHub and Render connections\n" .
         "🛑 <code>/cancel</code> — abort the wizard\n" .
         "🏠 <code>/menu</code> — back to the main menu\n\n" .
@@ -711,13 +661,13 @@ function show_check($chat) {
     }
 
     if (!$RENDER_ACCOUNTS) {
-        $lines[] = "❌ <b>Render</b> — no account connected\n     <i>Send /addaccount to connect one.</i>";
+        $lines[] = "❌ <b>Render</b> — no account connected\n     <i>Set RENDER_ACCOUNTS in Environment, then send /help.</i>";
     } else {
         foreach ($RENDER_ACCOUNTS as $i => $a) {
             [$c2, $svcs] = render_services($i);
             $lines[] = ($c2 === 200)
                 ? "✅ <b>Render — " . esc($a['name']) . "</b> — connected, " . count($svcs) . " web service(s)"
-                : "❌ <b>Render — " . esc($a['name']) . "</b> — request failed (HTTP " . esc($c2) . ")\n     <i>Check its key and owner ID.</i>";
+                : "❌ <b>Render — " . esc($a['name']) . "</b> — request failed (HTTP " . esc($c2) . ")\n     <i>Check its key is Full Access and still valid.</i>";
         }
     }
 
@@ -738,8 +688,8 @@ function show_accounts($chat) {
     global $RENDER_ACCOUNTS;
     if (!$RENDER_ACCOUNTS) {
         out($chat, "⚠️ <b>No Render account connected yet</b>\n\n" .
-                   "<i>Send /addaccount to connect one by pasting an API key — takes ten seconds.</i>",
-            [[['text' => '➕ Add a Render account', 'callback_data' => 'nav:addaccount']], kb_back()[0]]);
+                   "<i>Set RENDER_ACCOUNTS (or RENDER_API_KEY) in this bot's Render → Environment tab, " .
+                   "then send /help for the exact format.</i>", kb_back());
         return;
     }
 
@@ -750,14 +700,13 @@ function show_accounts($chat) {
     foreach ($RENDER_ACCOUNTS as $i => $a) {
         [$c, $svcs] = render_services($i);
         $email = account_email($i);
-        $tag = ($a['origin'] === 'manual') ? '  <i>· added in chat</i>' : '';
         if ($c !== 200) {
-            $lines[] = "🔀 <b>" . esc($a['name']) . "</b>$tag\n     ❌ connection error (HTTP " . esc($c) . ")";
+            $lines[] = "🔀 <b>" . esc($a['name']) . "</b>\n     ❌ connection error (HTTP " . esc($c) . ")";
             continue;
         }
         $count = count($svcs);
         $totalSites += $count;
-        $lines[] = "🔀 <b>" . esc($a['name']) . "</b>$tag\n" .
+        $lines[] = "🔀 <b>" . esc($a['name']) . "</b>\n" .
                    "     📧 " . esc($email ?: '—') . "\n" .
                    "     🗂 <code>$count</code> site(s)";
     }
@@ -767,132 +716,10 @@ function show_accounts($chat) {
         "🔀 <b>Render accounts</b>  <i>(" . count($RENDER_ACCOUNTS) . " · $totalSites site(s) total)</i>\n" .
         rule() . "\n" . implode("\n\n", $lines) . "\n\n" . rule() . "\n" .
         "🎲 <i>Next auto-deploy would use:</i> <b>" . esc(account_name($best)) . "</b>\n\n" .
-        "<i>Send /addaccount to connect another, or /removeaccount to remove one you added in chat.</i>",
-        [[['text' => '➕ Add account', 'callback_data' => 'nav:addaccount'],
-          ['text' => '➖ Remove account', 'callback_data' => 'nav:removeaccount']],
-         [['text' => '🗂 Browse my sites', 'callback_data' => 'nav:sites']],
+        "<i>Add or remove accounts anytime by editing RENDER_ACCOUNTS in this bot's Environment tab.</i>",
+        [[['text' => '🗂 Browse my sites', 'callback_data' => 'nav:sites']],
+         [['text' => '🚀 New deployment', 'callback_data' => 'nav:newhost']],
          kb_back()[0]]);
-}
-
-// ============================================================
-//  10b. ADD / REMOVE RENDER ACCOUNTS IN-CHAT
-// ============================================================
-function ask_add_account($chat) {
-    $s = load_state(); $s[$chat]['step'] = 'add_acct_key'; save_state($s);
-    out($chat,
-        "➕ <b>Connect a Render account</b>\n" . rule() . "\n" .
-        "🔑 Paste its <b>API key</b> — from Render → <i>Account Settings → API Keys</i>.\n\n" .
-        "I'll look up the owner and email myself; you don't need to find the owner ID.\n\n" .
-        "<i>🔐 I'll try to delete your message afterwards since it's a secret.</i>",
-        [[['text' => '❌ Cancel', 'callback_data' => 'cancel']]]);
-}
-
-function take_add_account_key($chat, $key, $msg_id) {
-    $key = trim((string)$key);
-    if ($key === '') { say($chat, "⚠️ Paste the API key text, please."); return; }
-    wipe($chat, $msg_id);
-
-    say($chat, "⏳ Checking that key with Render…");
-    [$c, $owners] = render_owners_for_key($key);
-    if ($c !== 200 || !$owners) {
-        out($chat, "❌ <b>That key didn't work</b> (HTTP " . esc($c) . ")\n\n" .
-                   "<i>Double-check you copied the whole key from Render → Account Settings → API Keys, " .
-                   "then send /addaccount to try again.</i>", kb_back());
-        return;
-    }
-
-    $s = load_state();
-    $s[$chat]['new_acct_key']    = $key;
-    $s[$chat]['new_acct_owners'] = $owners;
-
-    if (count($owners) === 1) {
-        $s[$chat]['new_acct_owner_id'] = $owners[0]['id'];
-        $s[$chat]['new_acct_email']    = $owners[0]['email'] ?: $owners[0]['name'];
-        $s[$chat]['step'] = 'add_acct_name';
-        save_state($s);
-        say($chat, "✅ Found it — <code>" . esc($owners[0]['email'] ?: $owners[0]['name']) . "</code>");
-        ask_add_account_name($chat);
-        return;
-    }
-
-    // The key has access to more than one workspace — let the admin pick.
-    $s[$chat]['step'] = 'add_acct_owner';
-    save_state($s);
-    $rows = [];
-    foreach ($owners as $i => $o) {
-        $rows[] = [['text' => "👤 " . ($o['email'] ?: $o['name']), 'callback_data' => "addacct_owner:$i"]];
-    }
-    $rows[] = [['text' => '❌ Cancel', 'callback_data' => 'cancel']];
-    out($chat, "🔀 <b>This key can access " . count($owners) . " workspaces</b>\n\nWhich one should I use?", $rows);
-}
-
-function pick_add_account_owner($chat, $i) {
-    $s = load_state();
-    $o = $s[$chat]['new_acct_owners'][$i] ?? null;
-    if (!$o) { out($chat, "⚠️ That expired — send /addaccount to start again.", kb_back()); return; }
-    $s[$chat]['new_acct_owner_id'] = $o['id'];
-    $s[$chat]['new_acct_email']    = $o['email'] ?: $o['name'];
-    $s[$chat]['step'] = 'add_acct_name';
-    save_state($s);
-    ask_add_account_name($chat);
-}
-
-function ask_add_account_name($chat) {
-    $s = load_state();
-    $suggested = 'Account ' . (count($GLOBALS['RENDER_ACCOUNTS']) + 1);
-    out($chat,
-        "🏷 <b>Give this account a short label</b>\n\n" .
-        "This is just how it shows up in menus — e.g. <code>Main</code> or <code>Backup</code>.\n" .
-        "📧 <code>" . esc($s[$chat]['new_acct_email'] ?? '') . "</code>\n\n" .
-        "✏️ Type a name, or tap Use suggested.",
-        [[['text' => "✅ Use \"$suggested\"", 'callback_data' => 'addacct_defname']],
-         [['text' => '❌ Cancel', 'callback_data' => 'cancel']]]);
-}
-
-function finish_add_account($chat, $name) {
-    $s = load_state();
-    $email = $s[$chat]['new_acct_email'] ?? '';
-    add_stored_account([
-        'name'     => $name,
-        'key'      => $s[$chat]['new_acct_key'] ?? '',
-        'owner_id' => $s[$chat]['new_acct_owner_id'] ?? '',
-        'email'    => $email,
-    ]);
-    unset($s[$chat]['new_acct_key'], $s[$chat]['new_acct_owners'], $s[$chat]['new_acct_owner_id'], $s[$chat]['new_acct_email']);
-    $s[$chat]['step'] = 'idle';
-    save_state($s);
-    out($chat,
-        "🎉 <b>Account connected</b>\n" . rule() . "\n" .
-        "🔀 <b>" . esc($name) . "</b>\n📧 <code>" . esc($email) . "</code>\n\n" .
-        "<i>It's live right now — no restart needed. You'll see it next time you deploy or browse sites.</i>",
-        kb_main());
-}
-
-function ask_remove_account($chat) {
-    $list = stored_accounts();
-    if (!$list) {
-        out($chat, "🤷 <b>Nothing to remove</b>\n\n" .
-                   "<i>Only accounts added with /addaccount can be removed here. Accounts set via " .
-                   "RENDER_ACCOUNTS are edited in Render's environment variables.</i>", kb_back());
-        return;
-    }
-    $rows = [];
-    foreach ($list as $i => $a) {
-        $rows[] = [['text' => '➖ ' . $a['name'] . ' (' . ($a['email'] ?: '—') . ')', 'callback_data' => "rmacct:$i"]];
-    }
-    $rows[] = [['text' => '🏠 Main menu', 'callback_data' => 'nav:menu']];
-    out($chat, "➖ <b>Remove a Render account</b>\n\n<i>Tap one to disconnect it. Its sites stay on Render — " .
-               "this only stops the bot from managing them.</i>", $rows);
-}
-
-function do_remove_account($chat, $i) {
-    $list = stored_accounts();
-    $name = $list[$i]['name'] ?? 'that account';
-    if (remove_stored_account_at($i)) {
-        out($chat, "🗑 <b>Removed</b>\n\n<code>" . esc($name) . "</code> is no longer connected.", kb_main());
-    } else {
-        out($chat, "⚠️ Couldn't find that entry — it may already be removed.", kb_main());
-    }
 }
 
 /**
@@ -1085,8 +912,7 @@ function ask_deploy_account($chat) {
 
     $s   = load_state();
     $sel = $s[$chat]['acct_sel'] ?? 'auto';
-    $best = pick_best_account();
-    $label = ($sel === 'auto') ? '🎲 Auto — right now would pick ' . account_name($best) : ('🔀 ' . account_name($sel));
+    $label = ($sel === 'auto') ? '🎲 Auto — spreads across accounts' : ('🔀 ' . account_name($sel));
 
     $rows = [];
     foreach ($RENDER_ACCOUNTS as $i => $a) {
@@ -1744,19 +1570,8 @@ if ($cb !== null) {
         if ($w === 'sites')    ask_account($chat, 'sites');
         if ($w === 'repos')    list_clones($chat);
         if ($w === 'accounts') show_accounts($chat);
-        if ($w === 'addaccount')    ask_add_account($chat);
-        if ($w === 'removeaccount') ask_remove_account($chat);
         if ($w === 'newhost')  { reset_flow($chat); list_repos($chat, 0); }
     }
-
-    elseif (strpos($cb, 'addacct_owner:') === 0) { toast(); pick_add_account_owner($chat, (int)substr($cb, 14)); }
-    elseif ($cb === 'addacct_defname') {
-        toast();
-        $s = load_state();
-        $name = 'Account ' . (count($GLOBALS['RENDER_ACCOUNTS']) + 1);
-        finish_add_account($chat, $name);
-    }
-    elseif (strpos($cb, 'rmacct:') === 0) { toast(); do_remove_account($chat, (int)substr($cb, 7)); }
 
     elseif (strpos($cb, 'acctsel:') === 0) {
         toast();
@@ -1862,10 +1677,6 @@ switch ($cmd) {
         show_check($chat);       http_response_code(200); echo 'ok'; exit;
     case '/accounts':
         show_accounts($chat);    http_response_code(200); echo 'ok'; exit;
-    case '/addaccount':
-        ask_add_account($chat);  http_response_code(200); echo 'ok'; exit;
-    case '/removeaccount':
-        ask_remove_account($chat); http_response_code(200); echo 'ok'; exit;
     case '/newhost':
         reset_flow($chat); list_repos($chat, 0);
         http_response_code(200); echo 'ok'; exit;
@@ -1886,15 +1697,6 @@ switch ($cmd) {
 if ($step === 'repo_search')     { list_repos($chat, 0, $text); }
 elseif ($step === 'repo_name')   { set_repo_name($chat, $text); }
 elseif ($step === 'collect')     { take_field($chat, $text, $msg_id); }
-elseif ($step === 'add_acct_key')  { take_add_account_key($chat, $text, $msg_id); }
-elseif ($step === 'add_acct_name') {
-    $name = trim((string)$text);
-    if ($name === '') { say($chat, "⚠️ Type a short label, or tap Use suggested above."); }
-    else { finish_add_account($chat, $name); }
-}
-elseif ($step === 'add_acct_owner') {
-    say($chat, "☝️ Tap one of the workspaces above.");
-}
 elseif ($step === 'review')      {
     say($chat, "☝️ Everything is ready — tap <b>✅ Create &amp; deploy</b> in the message above, " .
                "or send /cancel to back out.");
