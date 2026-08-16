@@ -1,7 +1,7 @@
 <?php
 /**
  * ╔══════════════════════════════════════════════════════════════════════╗
- * ║  TELEGRAM → GITHUB → RENDER DEPLOY BOT   (v4 — English UI)            ║
+ * ║  TELEGRAM → GITHUB → RENDER DEPLOY BOT   (v5 — multi-account Render)  ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  *
  *  HOW IT WORKS
@@ -12,12 +12,31 @@
  *          ├── copy → AveaBeauty-Zae   → own config.php → Render service #1
  *          └── copy → AveaBeauty-Mika  → own config.php → Render service #2
  *
+ *  MULTIPLE RENDER ACCOUNTS
+ *  You can plug in more than one Render account (handy once a free plan
+ *  hits its limit). Set RENDER_ACCOUNTS as a JSON array:
+ *
+ *    RENDER_ACCOUNTS = [
+ *      {"name":"Main",  "key":"rnd_xxx", "owner_id":"tea-aaa"},
+ *      {"name":"Backup","key":"rnd_yyy", "owner_id":"tea-bbb"}
+ *    ]
+ *
+ *  Everywhere you view or manage sites you first pick which account to
+ *  look at (or "🌐 All accounts" to see everything at once). When
+ *  deploying a new site you can also choose "🎲 Auto" — the bot tries
+ *  your accounts in order and automatically moves to the next one if the
+ *  current one refuses the new service (e.g. plan/service limit hit).
+ *
+ *  If RENDER_ACCOUNTS isn't set, the bot falls back to the old single
+ *  RENDER_API_KEY / RENDER_OWNER_ID env vars as "Account 1", so nothing
+ *  breaks for existing setups.
+ *
  *  COMMANDS
  *    /start /menu → main menu           /status → latest deploy state
  *    /newhost     → deployment wizard   /logs   → recent log lines
  *    /sites       → manage live sites   /check  → test API connections
- *    /repos       → list bot-made repos /cancel → abort the wizard
- *    /help        → how this works
+ *    /repos       → list bot-made repos /accounts → manage Render accounts
+ *    /cancel      → abort the wizard    /help   → how this works
  *
  *  All secrets live in Render environment variables. Nothing is hardcoded.
  */
@@ -32,8 +51,6 @@ $TELEGRAM_TOKEN  = getenv('TELEGRAM_TOKEN');
 $ADMIN_CHAT_ID   = getenv('ADMIN_CHAT_ID');
 $GITHUB_TOKEN    = getenv('GITHUB_TOKEN');
 $GITHUB_OWNER    = getenv('GITHUB_OWNER');
-$RENDER_API_KEY  = getenv('RENDER_API_KEY');
-$RENDER_OWNER_ID = getenv('RENDER_OWNER_ID');
 $RENDER_REGION   = getenv('RENDER_REGION') ?: 'singapore';
 $CONFIG_PATH     = getenv('CONFIG_PATH') ?: 'config.php';
 $STATE_FILE      = getenv('STATE_FILE') ?: '/tmp/bot_state.json';
@@ -41,6 +58,84 @@ $DEFAULT_PRIVATE = getenv('CLONE_PRIVATE') === null ? true : (getenv('CLONE_PRIV
 
 $PAGE_SIZE      = 8;     // buttons per page
 $MAX_COPY_FILES = 300;   // ceiling for the fallback copy method
+
+/** Manually-added Render accounts (via /addaccount) live in the state file. */
+function stored_accounts() {
+    global $STATE_FILE;
+    $s = file_exists($STATE_FILE) ? (json_decode(file_get_contents($STATE_FILE), true) ?: []) : [];
+    return $s['_accounts'] ?? [];
+}
+function save_stored_accounts($list) {
+    global $STATE_FILE;
+    $s = file_exists($STATE_FILE) ? (json_decode(file_get_contents($STATE_FILE), true) ?: []) : [];
+    $s['_accounts'] = array_values($list);
+    file_put_contents($STATE_FILE, json_encode($s));
+}
+function add_stored_account($acc) { $list = stored_accounts(); $list[] = $acc; save_stored_accounts($list); }
+function remove_stored_account_at($i) {
+    $list = stored_accounts();
+    if (!isset($list[$i])) return false;
+    array_splice($list, $i, 1);
+    save_stored_accounts($list);
+    return true;
+}
+
+/**
+ * Render accounts this bot can deploy to / manage.
+ *
+ * Two ways to add accounts:
+ *
+ *  1. Environment variable — RENDER_ACCOUNTS as a JSON array, set once
+ *     in Render's dashboard:
+ *       [{"name":"Main","key":"rnd_xxx","owner_id":"tea-aaa"}, ...]
+ *     "owner_id" is optional here — if you leave it out the bot looks
+ *     it up automatically from the key the first time it's used.
+ *
+ *  2. In-chat — send /addaccount and just paste the API key. The bot
+ *     calls Render to find the owner ID and the account's email for
+ *     you, asks for a short label, and saves it. No redeploy needed.
+ *     Remove one anytime with /removeaccount.
+ *
+ * No per-account "limit" here on purpose — Render enforces its own
+ * plan limits, and the bot already rotates to the next account
+ * automatically the moment an account's own limit response comes back.
+ */
+$RENDER_ACCOUNTS = [];
+$rawAccounts = getenv('RENDER_ACCOUNTS');
+if ($rawAccounts) {
+    $parsed = json_decode($rawAccounts, true);
+    if (is_array($parsed)) {
+        foreach ($parsed as $i => $a) {
+            $key = $a['key'] ?? $a['api_key'] ?? $a['RENDER_API_KEY'] ?? '';
+            $oid = $a['owner_id'] ?? $a['ownerId'] ?? $a['RENDER_OWNER_ID'] ?? '';
+            if ($key === '') continue;
+            $RENDER_ACCOUNTS[] = [
+                'name' => $a['name'] ?? ('Account ' . ($i + 1)),
+                'key' => $key, 'owner_id' => $oid, 'email' => $a['email'] ?? '', 'origin' => 'env',
+            ];
+        }
+    }
+}
+if (!$RENDER_ACCOUNTS) {
+    $fk = getenv('RENDER_API_KEY');
+    $fo = getenv('RENDER_OWNER_ID');
+    if ($fk) $RENDER_ACCOUNTS[] = ['name' => 'Account 1', 'key' => $fk, 'owner_id' => $fo ?: '', 'email' => '', 'origin' => 'env'];
+}
+// Accounts added in-chat via /addaccount live in the state file, so they
+// survive restarts without touching environment variables at all.
+foreach (stored_accounts() as $a) { $a['origin'] = 'manual'; $RENDER_ACCOUNTS[] = $a; }
+// Fill in any missing owner_id (e.g. RENDER_ACCOUNTS set without one) by
+// asking Render directly. render_owners_for_key()/http() are declared
+// further below, but PHP hoists top-level function declarations, so
+// calling them here at script start works fine.
+foreach ($RENDER_ACCOUNTS as $i => $a) {
+    if (!empty($a['owner_id'])) continue;
+    [, $owners] = render_owners_for_key($a['key']);
+    if ($owners) {
+        $RENDER_ACCOUNTS[$i]['owner_id'] = $owners[0]['id'];
+        if (empty($RENDER_ACCOUNTS[$i]['email'])) $RENDER_ACCOUNTS[$i]['email'] = $owners[0]['email'] ?: $owners[0]['name'];
+    }
+}
 
 /**
  * The questions the wizard asks, in order.
@@ -91,6 +186,9 @@ $STATUS_INFO = [
     'canceled'               => ['🚫', 'Stopped before it finished'],
     'unknown'                => ['❔', 'No deploy information yet'],
 ];
+
+/** Response bodies that usually mean "this account is full" — safe to auto-rotate on. */
+$LIMIT_HINTS = ['limit', 'quota', 'maximum number', 'upgrade your plan', 'plan limit', 'free instances'];
 
 // ============================================================
 //  2. LOW-LEVEL HTTP
@@ -185,11 +283,48 @@ function kb_main() {
          ['text' => '📦 My repos', 'callback_data' => 'nav:repos']],
         [['text' => '📊 Status', 'callback_data' => 'nav:status'],
          ['text' => '📜 Logs',   'callback_data' => 'nav:logs']],
+        [['text' => '🔀 Render accounts', 'callback_data' => 'nav:accounts']],
         [['text' => '🩺 Connection check', 'callback_data' => 'nav:check'],
          ['text' => '❓ Help', 'callback_data' => 'nav:help']],
     ];
 }
+function kb_main_no_accounts() {
+    // Shown when zero Render accounts are connected yet.
+    return [
+        [['text' => '➕ Add a Render account', 'callback_data' => 'nav:addaccount']],
+        [['text' => '❓ Help', 'callback_data' => 'nav:help']],
+    ];
+}
 function kb_back() { return [[['text' => '🏠 Main menu', 'callback_data' => 'nav:menu']]]; }
+
+/**
+ * Registers the "/" command menu Telegram shows the admin when they tap
+ * the little menu icon in the chat box. Cheap call, safe to repeat — we
+ * only actually fire it once per bot restart via a state flag.
+ */
+function ensure_bot_commands() {
+    $s = load_state();
+    if (!empty($s['_commands_set_v2'])) return;
+
+    tg('setMyCommands', ['commands' => [
+        ['command' => 'menu',     'description' => '🏠 Main menu'],
+        ['command' => 'newhost',  'description' => '🚀 Deploy a new client site'],
+        ['command' => 'sites',    'description' => '🗂 Manage your live sites'],
+        ['command' => 'repos',    'description' => '📦 Repos this bot has created'],
+        ['command' => 'status',   'description' => '📊 Latest deploy status'],
+        ['command' => 'logs',     'description' => '📜 Recent log lines'],
+        ['command' => 'accounts',      'description' => '🔀 Your Render accounts & site counts'],
+        ['command' => 'addaccount',    'description' => '➕ Connect another Render account'],
+        ['command' => 'removeaccount', 'description' => '➖ Disconnect a Render account'],
+        ['command' => 'check',         'description' => '🩺 Test GitHub & Render connections'],
+        ['command' => 'cancel',        'description' => '🛑 Abort the current wizard'],
+        ['command' => 'help',          'description' => '❓ How this bot works'],
+    ]]);
+
+    $s = load_state();
+    $s['_commands_set_v2'] = true;
+    save_state($s);
+}
 
 // ============================================================
 //  4. GITHUB & RENDER CLIENTS
@@ -203,25 +338,112 @@ function gh($method, $path, $body = null) {
     return [$c, json_decode($r, true)];
 }
 
-function rnd($method, $path, $body = null) {
-    global $RENDER_API_KEY;
-    $h = ["Authorization: Bearer $RENDER_API_KEY", "Accept: application/json"];
+/** account() resolves an index (or 'auto' → first) to its credentials. */
+function account($idx) {
+    global $RENDER_ACCOUNTS;
+    if ($idx === 'auto' || $idx === null) $idx = 0;
+    $idx = (int)$idx;
+    return $RENDER_ACCOUNTS[$idx] ?? ($RENDER_ACCOUNTS[0] ?? null);
+}
+
+function account_name($idx) {
+    $a = account($idx);
+    return $a ? $a['name'] : 'Unknown account';
+}
+
+/** How many web services currently sit on this account. */
+function account_count($idx) {
+    [, $svcs] = render_services($idx);
+    return count($svcs);
+}
+
+/** Ask Render which owner(s) an API key belongs to. */
+function render_owners_for_key($key) {
+    $h = ["Authorization: Bearer $key", "Accept: application/json"];
+    [$c, $r] = http('GET', "https://api.render.com/v1/owners?limit=20", $h);
+    $data = json_decode($r, true);
+    if ($c !== 200 || !is_array($data)) return [$c, []];
+    $owners = [];
+    foreach ($data as $item) {
+        $o = $item['owner'] ?? $item;
+        $owners[] = ['id' => $o['id'] ?? '', 'name' => $o['name'] ?? '', 'email' => $o['email'] ?? '', 'type' => $o['type'] ?? ''];
+    }
+    return [200, $owners];
+}
+
+/** The email tied to this account — stored if we already know it, looked up otherwise. */
+function account_email($idx) {
+    $a = account($idx);
+    if (!$a) return '';
+    if (!empty($a['email'])) return $a['email'];
+    [, $owners] = render_owners_for_key($a['key']);
+    foreach ($owners as $o) {
+        if (empty($a['owner_id']) || $o['id'] === $a['owner_id']) return $o['email'] ?: $o['name'];
+    }
+    return '';
+}
+
+/**
+ * Which account "Auto" uses next. Simple round-robin across every
+ * configured account, remembered between deployments — Render's own
+ * plan limit is what actually decides whether an attempt succeeds; this
+ * just spreads new sites out instead of always hammering account #1.
+ */
+function pick_best_account() {
+    global $RENDER_ACCOUNTS, $STATE_FILE;
+    if (!$RENDER_ACCOUNTS) return null;
+    $s = file_exists($STATE_FILE) ? (json_decode(file_get_contents($STATE_FILE), true) ?: []) : [];
+    $last = $s['_last_auto_acct'] ?? -1;
+    return ((int)$last + 1) % count($RENDER_ACCOUNTS);
+}
+function remember_auto_account($idx) {
+    $s = load_state();
+    $s['_last_auto_acct'] = $idx;
+    save_state($s);
+}
+
+/** All Render calls take an explicit account index — never a hidden default. */
+function rnd($method, $path, $body = null, $acctIdx = 0) {
+    $acct = account($acctIdx);
+    if (!$acct) return [0, ['message' => 'No Render account configured']];
+    $h = ["Authorization: Bearer {$acct['key']}", "Accept: application/json"];
     if ($body !== null) $h[] = "Content-Type: application/json";
     [$c, $r] = http($method, "https://api.render.com/v1$path", $h, $body !== null ? json_encode($body) : null);
     return [$c, json_decode($r, true)];
 }
 
-function render_services() {
-    global $RENDER_OWNER_ID;
-    [$c, $svcs] = rnd('GET', "/services?ownerId=$RENDER_OWNER_ID&limit=100");
+function render_services($acctIdx = 0) {
+    $acct = account($acctIdx);
+    if (!$acct) return [0, []];
+    [$c, $svcs] = rnd('GET', "/services?ownerId={$acct['owner_id']}&limit=100", null, $acctIdx);
     if ($c !== 200 || !is_array($svcs)) return [$c, []];
     $list = [];
     foreach ($svcs as $item) {
         $svc = $item['service'] ?? $item;
         if (($svc['type'] ?? '') !== 'web_service') continue;
+        $svc['_acct'] = $acctIdx;
         $list[] = $svc;
     }
     return [200, $list];
+}
+
+/** Services across every configured account, each tagged with its account index. */
+function render_services_all() {
+    global $RENDER_ACCOUNTS;
+    $all = [];
+    foreach ($RENDER_ACCOUNTS as $i => $a) {
+        [, $list] = render_services($i);
+        foreach ($list as $s) $all[] = $s;
+    }
+    return $all;
+}
+
+/** True-ish if a failed Render response looks like a plan/service limit, not a real error. */
+function looks_like_limit($body) {
+    global $LIMIT_HINTS;
+    $s = strtolower(is_array($body) ? json_encode($body) : (string)$body);
+    foreach ($LIMIT_HINTS as $hint) if (strpos($s, $hint) !== false) return true;
+    return false;
 }
 
 // ============================================================
@@ -235,13 +457,15 @@ function save_state($s) {
     global $STATE_FILE;
     file_put_contents($STATE_FILE, json_encode($s));
 }
-/** Clear the wizard but remember which service we are watching. */
+/** Clear the wizard but remember which service/account we are watching. */
 function reset_flow($chat) {
     $s = load_state();
-    $keep = $s[$chat]['service_id'] ?? null;
+    $keepSid  = $s[$chat]['service_id']   ?? null;
+    $keepAcct = $s[$chat]['service_acct'] ?? null;
     $seen = $s['_seen'] ?? [];
     $s[$chat] = ['step' => 'idle'];
-    if ($keep) $s[$chat]['service_id'] = $keep;
+    if ($keepSid !== null)  $s[$chat]['service_id']   = $keepSid;
+    if ($keepAcct !== null) $s[$chat]['service_acct'] = $keepAcct;
     $s['_seen'] = $seen;
     save_state($s);
 }
@@ -275,9 +499,9 @@ function repo_exists($owner, $name) {
     [$c] = gh('GET', "/repos/$owner/$name");
     return $c === 200;
 }
-/** If "avea-zae" is taken, try "avea-zae-2", "-3", and so on. */
-function free_service_name($base) {
-    [, $svcs] = render_services();
+/** If "avea-zae" is taken on the target account, try "avea-zae-2", "-3", and so on. */
+function free_service_name($base, $acctIdx) {
+    [, $svcs] = render_services($acctIdx);
     $taken = [];
     foreach ($svcs as $s) $taken[strtolower($s['name'] ?? '')] = true;
     $name = $base; $i = 2;
@@ -392,16 +616,35 @@ function replace_var($content, $var, $value) {
 //  9. MENU, HELP, DIAGNOSTICS
 // ============================================================
 function show_menu($chat) {
+    global $RENDER_ACCOUNTS;
+
+    if (!$RENDER_ACCOUNTS) {
+        out($chat,
+            "🏠 <b>Deploy Bot</b>\n" . rule() . "\n" .
+            "I copy one of your GitHub repos, drop in a fresh <code>config.php</code>, " .
+            "and put the copy live on Render.\n\n" .
+            "⚠️ <b>No Render account connected yet.</b>\n" .
+            "Tap below and paste an API key — takes ten seconds, no redeploy needed.",
+            kb_main_no_accounts());
+        return;
+    }
+
+    $acctLine = count($RENDER_ACCOUNTS) > 1
+        ? "🔀 <b>" . count($RENDER_ACCOUNTS) . " Render accounts</b> connected — pick one anytime, or view all together.\n\n"
+        : '';
     out($chat,
         "🏠 <b>Deploy Bot</b>\n" . rule() . "\n" .
         "I copy one of your GitHub repos, drop in a fresh <code>config.php</code>, " .
         "and put the copy live on Render.\n\n" .
         "Your original repo is never edited — every client gets their own copy.\n\n" .
+        $acctLine .
         "👇 <i>Pick something below, or type a command.</i>",
         kb_main());
 }
 
 function show_help($chat) {
+    global $RENDER_ACCOUNTS;
+    $multi = count($RENDER_ACCOUNTS) > 1;
     out($chat,
         "❓ <b>How this bot works</b>\n" . rule() . "\n\n" .
         "<b>The idea</b>\n" .
@@ -413,28 +656,46 @@ function show_help($chat) {
         "<b>The wizard, step by step</b>\n" .
         "1️⃣ Pick the template repo to copy\n" .
         "2️⃣ Name the new repo (e.g. <code>AveaBeauty-Zae</code>)\n" .
-        "3️⃣ Answer the config questions one at a time\n" .
-        "4️⃣ Review everything, then confirm\n\n" .
-        "Nothing is created until you tap <b>Create &amp; deploy</b> in step 4. " .
+        ($multi ? "3️⃣ Choose which Render account to deploy to\n4️⃣ Answer the config questions one at a time\n5️⃣ Review everything, then confirm\n\n"
+                : "3️⃣ Answer the config questions one at a time\n4️⃣ Review everything, then confirm\n\n") .
+        "Nothing is created until you tap <b>Create &amp; deploy</b> in the last step. " .
         "You can back out with ❌ Cancel at any point.\n\n" .
+        "<b>Multiple Render accounts</b>\n" .
+        "You currently have <b>" . count($RENDER_ACCOUNTS) . "</b> account(s) connected.\n\n" .
+        "🟢 <b>Easiest — add one in chat:</b> send <code>/addaccount</code> and paste the API key. " .
+        "The bot finds the owner and email itself, asks you to name it, done. No redeploy.\n\n" .
+        "⚙️ <b>Or via environment variable:</b> set <code>RENDER_ACCOUNTS</code> in Render as a JSON list:\n" .
+        "<pre>[\n  {\"name\":\"Main\",\"key\":\"rnd_xxx\"},\n  {\"name\":\"Backup\",\"key\":\"rnd_yyy\"}\n]</pre>\n" .
+        "<code>key</code> is from Render → Account Settings → API Keys — the bot looks up the owner " .
+        "ID and email for you if you don't include them.\n\n" .
+        "No \"limit\" setting on purpose — Render enforces its own plan limits. Everywhere you view " .
+        "sites you pick an account first (or 🌐 All accounts to see everything together). When " .
+        "deploying, 🎲 <b>Auto</b> is the default: it rotates across your accounts, and the moment " .
+        "Render itself says the current one is full it silently moves to the next.\n\n" .
+        "<code>/accounts</code> — see every connected account and its email\n" .
+        "<code>/removeaccount</code> — disconnect one you added in chat\n\n" .
         "<b>Commands</b>\n" .
         "🚀 <code>/newhost</code> — start the wizard\n" .
         "🗂 <code>/sites</code> — redeploy, restart, stop or delete a site\n" .
         "📦 <code>/repos</code> — repos this bot has created\n" .
         "📊 <code>/status</code> — how the latest deploy is doing\n" .
         "📜 <code>/logs</code> — last 40 log lines\n" .
+        "🔀 <code>/accounts</code> — your connected Render accounts\n" .
+        "➕ <code>/addaccount</code> — connect another Render account\n" .
+        "➖ <code>/removeaccount</code> — disconnect one added in chat\n" .
         "🩺 <code>/check</code> — test the GitHub and Render connections\n" .
         "🛑 <code>/cancel</code> — abort the wizard\n" .
         "🏠 <code>/menu</code> — back to the main menu\n\n" .
         "<b>One-time setup to check</b>\n" .
         "On GitHub go to <i>Settings → Applications → Render</i> and give it access to " .
-        "<b>All repositories</b>. Otherwise Render can't see the new repos this bot makes.",
+        "<b>All repositories</b>. Do this for <u>every</u> Render account you connect — otherwise " .
+        "that account can't see the new repos this bot makes.",
         kb_back());
 }
 
 /** Quick health check so a failure later is easier to diagnose. */
 function show_check($chat) {
-    global $GITHUB_OWNER, $RENDER_OWNER_ID, $RENDER_REGION, $CONFIG_PATH, $ADMIN_CHAT_ID;
+    global $GITHUB_OWNER, $RENDER_ACCOUNTS, $RENDER_REGION, $CONFIG_PATH, $ADMIN_CHAT_ID;
     out($chat, "🩺 Running checks…");
 
     $lines = [];
@@ -449,10 +710,16 @@ function show_check($chat) {
                    "</code> but the token belongs to <code>" . esc($me['login']) . "</code>";
     }
 
-    [$c2, $svcs] = render_services();
-    $lines[] = ($c2 === 200)
-        ? "✅ <b>Render</b> — connected, " . count($svcs) . " web service(s) found"
-        : "❌ <b>Render</b> — request failed (HTTP " . esc($c2) . ")\n     <i>Check RENDER_API_KEY and RENDER_OWNER_ID.</i>";
+    if (!$RENDER_ACCOUNTS) {
+        $lines[] = "❌ <b>Render</b> — no account connected\n     <i>Send /addaccount to connect one.</i>";
+    } else {
+        foreach ($RENDER_ACCOUNTS as $i => $a) {
+            [$c2, $svcs] = render_services($i);
+            $lines[] = ($c2 === 200)
+                ? "✅ <b>Render — " . esc($a['name']) . "</b> — connected, " . count($svcs) . " web service(s)"
+                : "❌ <b>Render — " . esc($a['name']) . "</b> — request failed (HTTP " . esc($c2) . ")\n     <i>Check its key and owner ID.</i>";
+        }
+    }
 
     $lines[] = "📄 Config file: <code>" . esc($CONFIG_PATH) . "</code>";
     $lines[] = "🌏 Region: <code>" . esc($RENDER_REGION) . "</code>";
@@ -460,12 +727,201 @@ function show_check($chat) {
 
     say($chat,
         "🩺 <b>Connection check</b>\n" . rule() . "\n" . implode("\n", $lines) . "\n\n" .
-        "<i>If both GitHub and Render show ✅, the wizard should work end to end.</i>",
+        "<i>If GitHub and every Render account show ✅, the wizard should work end to end.</i>",
         kb_main());
 }
 
 // ============================================================
-//  10. STEP 1 — CHOOSE THE TEMPLATE REPO
+//  10. RENDER ACCOUNTS — VIEW / PICK
+// ============================================================
+function show_accounts($chat) {
+    global $RENDER_ACCOUNTS;
+    if (!$RENDER_ACCOUNTS) {
+        out($chat, "⚠️ <b>No Render account connected yet</b>\n\n" .
+                   "<i>Send /addaccount to connect one by pasting an API key — takes ten seconds.</i>",
+            [[['text' => '➕ Add a Render account', 'callback_data' => 'nav:addaccount']], kb_back()[0]]);
+        return;
+    }
+
+    out($chat, "🔀 Checking your accounts…");
+
+    $lines = [];
+    $totalSites = 0;
+    foreach ($RENDER_ACCOUNTS as $i => $a) {
+        [$c, $svcs] = render_services($i);
+        $email = account_email($i);
+        $tag = ($a['origin'] === 'manual') ? '  <i>· added in chat</i>' : '';
+        if ($c !== 200) {
+            $lines[] = "🔀 <b>" . esc($a['name']) . "</b>$tag\n     ❌ connection error (HTTP " . esc($c) . ")";
+            continue;
+        }
+        $count = count($svcs);
+        $totalSites += $count;
+        $lines[] = "🔀 <b>" . esc($a['name']) . "</b>$tag\n" .
+                   "     📧 " . esc($email ?: '—') . "\n" .
+                   "     🗂 <code>$count</code> site(s)";
+    }
+
+    $best = pick_best_account();
+    say($chat,
+        "🔀 <b>Render accounts</b>  <i>(" . count($RENDER_ACCOUNTS) . " · $totalSites site(s) total)</i>\n" .
+        rule() . "\n" . implode("\n\n", $lines) . "\n\n" . rule() . "\n" .
+        "🎲 <i>Next auto-deploy would use:</i> <b>" . esc(account_name($best)) . "</b>\n\n" .
+        "<i>Send /addaccount to connect another, or /removeaccount to remove one you added in chat.</i>",
+        [[['text' => '➕ Add account', 'callback_data' => 'nav:addaccount'],
+          ['text' => '➖ Remove account', 'callback_data' => 'nav:removeaccount']],
+         [['text' => '🗂 Browse my sites', 'callback_data' => 'nav:sites']],
+         kb_back()[0]]);
+}
+
+// ============================================================
+//  10b. ADD / REMOVE RENDER ACCOUNTS IN-CHAT
+// ============================================================
+function ask_add_account($chat) {
+    $s = load_state(); $s[$chat]['step'] = 'add_acct_key'; save_state($s);
+    out($chat,
+        "➕ <b>Connect a Render account</b>\n" . rule() . "\n" .
+        "🔑 Paste its <b>API key</b> — from Render → <i>Account Settings → API Keys</i>.\n\n" .
+        "I'll look up the owner and email myself; you don't need to find the owner ID.\n\n" .
+        "<i>🔐 I'll try to delete your message afterwards since it's a secret.</i>",
+        [[['text' => '❌ Cancel', 'callback_data' => 'cancel']]]);
+}
+
+function take_add_account_key($chat, $key, $msg_id) {
+    $key = trim((string)$key);
+    if ($key === '') { say($chat, "⚠️ Paste the API key text, please."); return; }
+    wipe($chat, $msg_id);
+
+    say($chat, "⏳ Checking that key with Render…");
+    [$c, $owners] = render_owners_for_key($key);
+    if ($c !== 200 || !$owners) {
+        out($chat, "❌ <b>That key didn't work</b> (HTTP " . esc($c) . ")\n\n" .
+                   "<i>Double-check you copied the whole key from Render → Account Settings → API Keys, " .
+                   "then send /addaccount to try again.</i>", kb_back());
+        return;
+    }
+
+    $s = load_state();
+    $s[$chat]['new_acct_key']    = $key;
+    $s[$chat]['new_acct_owners'] = $owners;
+
+    if (count($owners) === 1) {
+        $s[$chat]['new_acct_owner_id'] = $owners[0]['id'];
+        $s[$chat]['new_acct_email']    = $owners[0]['email'] ?: $owners[0]['name'];
+        $s[$chat]['step'] = 'add_acct_name';
+        save_state($s);
+        say($chat, "✅ Found it — <code>" . esc($owners[0]['email'] ?: $owners[0]['name']) . "</code>");
+        ask_add_account_name($chat);
+        return;
+    }
+
+    // The key has access to more than one workspace — let the admin pick.
+    $s[$chat]['step'] = 'add_acct_owner';
+    save_state($s);
+    $rows = [];
+    foreach ($owners as $i => $o) {
+        $rows[] = [['text' => "👤 " . ($o['email'] ?: $o['name']), 'callback_data' => "addacct_owner:$i"]];
+    }
+    $rows[] = [['text' => '❌ Cancel', 'callback_data' => 'cancel']];
+    out($chat, "🔀 <b>This key can access " . count($owners) . " workspaces</b>\n\nWhich one should I use?", $rows);
+}
+
+function pick_add_account_owner($chat, $i) {
+    $s = load_state();
+    $o = $s[$chat]['new_acct_owners'][$i] ?? null;
+    if (!$o) { out($chat, "⚠️ That expired — send /addaccount to start again.", kb_back()); return; }
+    $s[$chat]['new_acct_owner_id'] = $o['id'];
+    $s[$chat]['new_acct_email']    = $o['email'] ?: $o['name'];
+    $s[$chat]['step'] = 'add_acct_name';
+    save_state($s);
+    ask_add_account_name($chat);
+}
+
+function ask_add_account_name($chat) {
+    $s = load_state();
+    $suggested = 'Account ' . (count($GLOBALS['RENDER_ACCOUNTS']) + 1);
+    out($chat,
+        "🏷 <b>Give this account a short label</b>\n\n" .
+        "This is just how it shows up in menus — e.g. <code>Main</code> or <code>Backup</code>.\n" .
+        "📧 <code>" . esc($s[$chat]['new_acct_email'] ?? '') . "</code>\n\n" .
+        "✏️ Type a name, or tap Use suggested.",
+        [[['text' => "✅ Use \"$suggested\"", 'callback_data' => 'addacct_defname']],
+         [['text' => '❌ Cancel', 'callback_data' => 'cancel']]]);
+}
+
+function finish_add_account($chat, $name) {
+    $s = load_state();
+    $email = $s[$chat]['new_acct_email'] ?? '';
+    add_stored_account([
+        'name'     => $name,
+        'key'      => $s[$chat]['new_acct_key'] ?? '',
+        'owner_id' => $s[$chat]['new_acct_owner_id'] ?? '',
+        'email'    => $email,
+    ]);
+    unset($s[$chat]['new_acct_key'], $s[$chat]['new_acct_owners'], $s[$chat]['new_acct_owner_id'], $s[$chat]['new_acct_email']);
+    $s[$chat]['step'] = 'idle';
+    save_state($s);
+    out($chat,
+        "🎉 <b>Account connected</b>\n" . rule() . "\n" .
+        "🔀 <b>" . esc($name) . "</b>\n📧 <code>" . esc($email) . "</code>\n\n" .
+        "<i>It's live right now — no restart needed. You'll see it next time you deploy or browse sites.</i>",
+        kb_main());
+}
+
+function ask_remove_account($chat) {
+    $list = stored_accounts();
+    if (!$list) {
+        out($chat, "🤷 <b>Nothing to remove</b>\n\n" .
+                   "<i>Only accounts added with /addaccount can be removed here. Accounts set via " .
+                   "RENDER_ACCOUNTS are edited in Render's environment variables.</i>", kb_back());
+        return;
+    }
+    $rows = [];
+    foreach ($list as $i => $a) {
+        $rows[] = [['text' => '➖ ' . $a['name'] . ' (' . ($a['email'] ?: '—') . ')', 'callback_data' => "rmacct:$i"]];
+    }
+    $rows[] = [['text' => '🏠 Main menu', 'callback_data' => 'nav:menu']];
+    out($chat, "➖ <b>Remove a Render account</b>\n\n<i>Tap one to disconnect it. Its sites stay on Render — " .
+               "this only stops the bot from managing them.</i>", $rows);
+}
+
+function do_remove_account($chat, $i) {
+    $list = stored_accounts();
+    $name = $list[$i]['name'] ?? 'that account';
+    if (remove_stored_account_at($i)) {
+        out($chat, "🗑 <b>Removed</b>\n\n<code>" . esc($name) . "</code> is no longer connected.", kb_main());
+    } else {
+        out($chat, "⚠️ Couldn't find that entry — it may already be removed.", kb_main());
+    }
+}
+
+/**
+ * Account picker shown before any "which sites do you want to see" action.
+ * $purpose becomes part of the callback_data so we know where to go next
+ * once an account (or "all") is picked — see acctsel: handling below.
+ */
+function ask_account($chat, $purpose) {
+    global $RENDER_ACCOUNTS;
+    if (count($RENDER_ACCOUNTS) <= 1) {
+        // Nothing to pick — go straight to the destination with account 0.
+        route_after_account($chat, $purpose, 0);
+        return;
+    }
+    $rows = [];
+    foreach ($RENDER_ACCOUNTS as $i => $a) {
+        $rows[] = [['text' => "🔀 " . $a['name'], 'callback_data' => "acctsel:$purpose:$i"]];
+    }
+    $rows[] = [['text' => '🌐 All accounts', 'callback_data' => "acctsel:$purpose:all"]];
+    $rows[] = [['text' => '🏠 Main menu', 'callback_data' => 'nav:menu']];
+    out($chat, "🔀 <b>Which Render account?</b>\n\n<i>Tap one, or show everything together.</i>", $rows);
+}
+
+function route_after_account($chat, $purpose, $acctSel) {
+    if ($purpose === 'sites') list_services($chat, 0, $acctSel);
+}
+
+// ============================================================
+//  11. STEP 1 — CHOOSE THE TEMPLATE REPO
 // ============================================================
 function list_repos($chat, $page = 0, $filter = '') {
     global $PAGE_SIZE;
@@ -526,7 +982,7 @@ function list_repos($chat, $page = 0, $filter = '') {
     $rows[] = [['text' => '🔍 Search', 'callback_data' => 'reposearch'],
                ['text' => '❌ Cancel', 'callback_data' => 'cancel']];
 
-    $head  = "🚀 <b>New deployment</b>   <i>step 1 of 4</i>\n" . bar(1, 4) . "\n" . rule() . "\n";
+    $head  = "🚀 <b>New deployment</b>   <i>step 1 of " . wizard_total_steps() . "</i>\n" . bar(1, wizard_total_steps()) . "\n" . rule() . "\n";
     $head .= "🧩 <b>Which repo should I copy?</b>\n\n";
     $head .= "This one stays exactly as it is — I only make a copy of it.\n\n";
     $head .= "<i>🧩 already a template · 🔒 private · 📂 public</i>";
@@ -535,8 +991,14 @@ function list_repos($chat, $page = 0, $filter = '') {
     out($chat, $head, $rows);
 }
 
+/** Wizard has one extra step when there's more than one Render account to pick from. */
+function wizard_total_steps() {
+    global $RENDER_ACCOUNTS;
+    return count($RENDER_ACCOUNTS) > 1 ? 5 : 4;
+}
+
 // ============================================================
-//  11. STEP 2 — NAME THE NEW REPO
+//  12. STEP 2 — NAME THE NEW REPO
 // ============================================================
 function ask_repo_name($chat) {
     global $DEFAULT_PRIVATE;
@@ -546,7 +1008,7 @@ function ask_repo_name($chat) {
     $priv = $s[$chat]['private'] ?? $DEFAULT_PRIVATE;
 
     out($chat,
-        "🚀 <b>New deployment</b>   <i>step 2 of 4</i>\n" . bar(2, 4) . "\n" . rule() . "\n" .
+        "🚀 <b>New deployment</b>   <i>step 2 of " . wizard_total_steps() . "</i>\n" . bar(2, wizard_total_steps()) . "\n" . rule() . "\n" .
         "🧩 Template: <code>" . esc($src) . "</code>\n" .
         "🌿 Branch: <code>" . esc($s[$chat]['src_branch']) . "</code>\n" .
         rule() . "\n" .
@@ -597,6 +1059,7 @@ function set_repo_name($chat, $raw) {
     $s = load_state();
     $s[$chat]['new_name']  = $name;
     $s[$chat]['private']   = $s[$chat]['private'] ?? $DEFAULT_PRIVATE;
+    $s[$chat]['acct_sel']  = $s[$chat]['acct_sel'] ?? 'auto';
     $s[$chat]['step']      = 'collect';
     $s[$chat]['field_idx'] = 0;
     $s[$chat]['values']    = [];
@@ -604,12 +1067,49 @@ function set_repo_name($chat, $raw) {
 
     say($chat, "✅ <b>Name reserved</b>\n📦 <code>" . esc($GITHUB_OWNER) . "/" . esc($name) . "</code>\n\n" .
                "<i>Nothing has been created yet — that happens at the end.</i>");
-    ask_next_field($chat);
+
+    ask_deploy_account($chat);
 }
 
 // ============================================================
-//  12. STEP 3 — COLLECT CONFIG VALUES
+//  12b. STEP 2.5 — WHICH RENDER ACCOUNT TO DEPLOY TO
 // ============================================================
+function ask_deploy_account($chat) {
+    global $RENDER_ACCOUNTS;
+
+    if (count($RENDER_ACCOUNTS) <= 1) {
+        // Only one account exists — nothing to choose, skip straight ahead.
+        ask_next_field($chat);
+        return;
+    }
+
+    $s   = load_state();
+    $sel = $s[$chat]['acct_sel'] ?? 'auto';
+    $best = pick_best_account();
+    $label = ($sel === 'auto') ? '🎲 Auto — right now would pick ' . account_name($best) : ('🔀 ' . account_name($sel));
+
+    $rows = [];
+    foreach ($RENDER_ACCOUNTS as $i => $a) {
+        $rows[] = [['text' => ($sel === (string)$i ? '✅ ' : '') . $a['name'], 'callback_data' => "setacct:$i"]];
+    }
+    $rows[] = [['text' => ($sel === 'auto' ? '✅ ' : '') . '🎲 Auto — spread across accounts (default)', 'callback_data' => 'setacct:auto']];
+    $rows[] = [['text' => '➡️ Continue', 'callback_data' => 'acctdone']];
+    $rows[] = [['text' => '❌ Cancel', 'callback_data' => 'cancel']];
+
+    out($chat,
+        "🚀 <b>New deployment</b>   <i>step 3 of " . wizard_total_steps() . "</i>\n" . bar(3, wizard_total_steps()) . "\n" . rule() . "\n" .
+        "🔀 <b>Which Render account should host this site?</b>\n\n" .
+        "Currently selected: <b>" . esc($label) . "</b>\n\n" .
+        "<i>🎲 Auto rotates across your connected accounts, and moves to the next one right away " .
+        "if Render says the current one is full.</i>",
+        $rows);
+}
+
+// ============================================================
+//  13. STEP 3/4 — COLLECT CONFIG VALUES
+// ============================================================
+function collect_step_num() { return wizard_total_steps() === 5 ? 4 : 3; }
+
 function ask_next_field($chat) {
     global $CONFIG_FIELDS;
     $s     = load_state();
@@ -629,8 +1129,9 @@ function ask_next_field($chat) {
         ? "🔴 <i>Required — this one can't be skipped.</i>"
         : "⚪ <i>Optional — skipping keeps the template's existing value.</i>";
 
+    $step = collect_step_num();
     out($chat,
-        "🚀 <b>New deployment</b>   <i>step 3 of 4</i>\n" . bar(3, 4) . "\n" . rule() . "\n" .
+        "🚀 <b>New deployment</b>   <i>step $step of " . wizard_total_steps() . "</i>\n" . bar($step, wizard_total_steps()) . "\n" . rule() . "\n" .
         "⚙️ <b>Setting " . ($idx + 1) . " of $total</b>\n\n" .
         "{$f['emoji']} <b>" . esc($f['label']) . "</b>\n" .
         "Goes into <code>\$" . esc($key) . "</code>\n\n" .
@@ -696,10 +1197,10 @@ function skip_field($chat) {
 }
 
 // ============================================================
-//  13. STEP 4 — REVIEW BEFORE ANYTHING IS CREATED
+//  14. FINAL STEP — REVIEW BEFORE ANYTHING IS CREATED
 // ============================================================
 function review($chat) {
-    global $CONFIG_FIELDS, $CONFIG_PATH, $RENDER_REGION, $GITHUB_OWNER;
+    global $CONFIG_FIELDS, $CONFIG_PATH, $RENDER_REGION, $GITHUB_OWNER, $RENDER_ACCOUNTS;
     $s = load_state();
     $s[$chat]['step'] = 'review';
     save_state($s);
@@ -715,15 +1216,21 @@ function review($chat) {
         }
     }
     $svcName = sanitize_service_name($s[$chat]['new_name']);
+    $acctSel = $s[$chat]['acct_sel'] ?? 'auto';
+    $acctLabel = ($acctSel === 'auto')
+        ? '🎲 Auto (' . implode(' → ', array_column($RENDER_ACCOUNTS, 'name')) . ')'
+        : '🔀 ' . account_name($acctSel);
 
+    $total = wizard_total_steps();
     out($chat,
-        "🚀 <b>New deployment</b>   <i>step 4 of 4</i>\n" . bar(4, 4) . "\n" . rule() . "\n" .
+        "🚀 <b>New deployment</b>   <i>step $total of $total</i>\n" . bar($total, $total) . "\n" . rule() . "\n" .
         "📋 <b>Ready — please review</b>\n\n" .
         "🧩 Copy from: <code>" . esc($s[$chat]['src_repo']) . "</code>\n" .
         "         ↓\n" .
         "📦 New repo: <code>" . esc($GITHUB_OWNER) . "/" . esc($s[$chat]['new_name']) . "</code>\n" .
         "👁 Visibility: " . (($s[$chat]['private'] ?? true) ? '🔒 private' : '🌐 public') . "\n" .
         "🏷 Render service: <code>" . esc($svcName) . "</code>\n" .
+        (count($RENDER_ACCOUNTS) > 1 ? "🔀 Render account: " . esc($acctLabel) . "\n" : '') .
         "🌏 Region: <code>" . esc($RENDER_REGION) . "</code>\n" .
         rule() . "\n" .
         "⚙️ <b>" . esc($CONFIG_PATH) . " changes</b>\n" . $lines .
@@ -739,10 +1246,10 @@ function review($chat) {
 }
 
 // ============================================================
-//  14. BUILD: CLONE → CONFIG → DEPLOY
+//  15. BUILD: CLONE → CONFIG → DEPLOY  (with account auto-rotate)
 // ============================================================
 function build_everything($chat) {
-    global $GITHUB_OWNER, $CONFIG_PATH, $RENDER_OWNER_ID, $RENDER_REGION, $FIELD_ALIASES;
+    global $GITHUB_OWNER, $CONFIG_PATH, $RENDER_REGION, $FIELD_ALIASES, $RENDER_ACCOUNTS;
 
     $s      = load_state();
     $src    = $s[$chat]['src_repo']   ?? null;
@@ -750,6 +1257,7 @@ function build_everything($chat) {
     $name   = $s[$chat]['new_name']   ?? null;
     $priv   = $s[$chat]['private']    ?? true;
     $values = $s[$chat]['values']     ?? [];
+    $acctSel = $s[$chat]['acct_sel']  ?? 'auto';
 
     if (!$src || !$name) {
         reset_flow($chat);
@@ -758,8 +1266,10 @@ function build_everything($chat) {
         return;
     }
 
+    $totalSteps = 3;
+
     // ── 1 of 3 · copy the template ───────────────────────────
-    out($chat, "⏳ <b>Working…</b>  " . bar(1, 3) . "\n\n🧩 Copying <code>" . esc($src) .
+    out($chat, "⏳ <b>Working…</b>  " . bar(1, $totalSteps) . "\n\n🧩 Copying <code>" . esc($src) .
                "</code> → <code>" . esc($name) . "</code>\n<i>This usually takes a few seconds.</i>");
 
     $desc = "Copy of $src — created by deploy bot";
@@ -783,7 +1293,7 @@ function build_everything($chat) {
                "🔗 https://github.com/$newFull");
 
     // ── 2 of 3 · write the config ────────────────────────────
-    say($chat, "⏳ <b>Working…</b>  " . bar(2, 3) . "\n\n📝 Updating <code>" . esc($CONFIG_PATH) . "</code>");
+    say($chat, "⏳ <b>Working…</b>  " . bar(2, $totalSteps) . "\n\n📝 Updating <code>" . esc($CONFIG_PATH) . "</code>");
 
     $file = wait_for_file($newFull, $newBranch, $CONFIG_PATH);
     if (!$file) {
@@ -826,63 +1336,101 @@ function build_everything($chat) {
         "   <i>Those variables may be named differently in your template.</i>\n";
     say($chat, $msg);
 
-    // ── 3 of 3 · create the Render service ───────────────────
-    say($chat, "⏳ <b>Working…</b>  " . bar(3, 3) . "\n\n🛠 Creating the Render service");
-    $svcName = free_service_name(sanitize_service_name($name));
+    // ── 3 of 3 · create the Render service, rotating accounts if needed ──
+    say($chat, "⏳ <b>Working…</b>  " . bar(3, $totalSteps) . "\n\n🛠 Creating the Render service");
 
-    [$c3, $created] = rnd('POST', '/services', [
-        'type' => 'web_service', 'name' => $svcName, 'ownerId' => $RENDER_OWNER_ID,
-        'repo' => "https://github.com/$newFull", 'branch' => $newBranch, 'autoDeploy' => 'yes',
-        'serviceDetails' => [
-            'region' => $RENDER_REGION, 'plan' => 'free', 'runtime' => 'docker',
-            'envSpecificDetails' => ['dockerfilePath' => './Dockerfile', 'dockerContext' => '.'],
-        ],
-    ]);
-    if ($c3 < 200 || $c3 >= 300) {
+    if ($acctSel === 'auto') {
+        // Round-robin starting point, then fall through the rest in
+        // listed order as a safety net if the first pick is full.
+        $best = pick_best_account();
+        $tryOrder = array_values(array_unique(array_merge([$best], array_keys($RENDER_ACCOUNTS))));
+    } else {
+        $tryOrder = [(int)$acctSel];
+    }
+
+    $sid = null; $usedAcct = null; $lastErr = null; $lastCode = null; $attempts = [];
+    foreach ($tryOrder as $acctIdx) {
+        $acct = account($acctIdx);
+        if (!$acct) continue;
+
+        $svcName = free_service_name(sanitize_service_name($name), $acctIdx);
+
+        [$c3, $created] = rnd('POST', '/services', [
+            'type' => 'web_service', 'name' => $svcName, 'ownerId' => $acct['owner_id'],
+            'repo' => "https://github.com/$newFull", 'branch' => $newBranch, 'autoDeploy' => 'yes',
+            'serviceDetails' => [
+                'region' => $RENDER_REGION, 'plan' => 'free', 'runtime' => 'docker',
+                'envSpecificDetails' => ['dockerfilePath' => './Dockerfile', 'dockerContext' => '.'],
+            ],
+        ], $acctIdx);
+
+        if ($c3 >= 200 && $c3 < 300) {
+            $sid = $created['service']['id'] ?? ($created['id'] ?? null);
+            $usedAcct = $acctIdx;
+            break;
+        }
+
+        $attempts[] = $acct['name'] . ' (HTTP ' . $c3 . ')';
+        $lastErr = $created; $lastCode = $c3;
+
+        // Only silently rotate to the next account when this looks like a
+        // plan/service limit — a real error (bad repo, auth, etc) should stop.
+        if ($acctSel === 'auto' && looks_like_limit($created) && $acctIdx !== end($tryOrder)) {
+            say($chat, "⚠️ <b>" . esc($acct['name']) . "</b> looks full — trying the next account…");
+            continue;
+        }
+        break;
+    }
+
+    if (!$sid) {
         reset_flow($chat);
-        say($chat, "❌ <b>Couldn't create the Render service</b> (HTTP " . esc($c3) . ")\n<code>" .
-                   esc(substr(json_encode($created), 0, 250)) . "</code>\n\n" .
+        $triedTxt = $attempts ? "\n\n<i>Tried: " . esc(implode(', ', $attempts)) . "</i>" : '';
+        say($chat, "❌ <b>Couldn't create the Render service</b> (HTTP " . esc($lastCode) . ")\n<code>" .
+                   esc(substr(json_encode($lastErr), 0, 250)) . "</code>" . $triedTxt . "\n\n" .
                    "💡 <b>If it says the repo wasn't found:</b> on GitHub go to " .
                    "<i>Settings → Applications → Render</i> and switch it to <b>All repositories</b>. " .
                    "Then open /sites and deploy from there.\n\n" .
                    "📦 Your repo is safe: https://github.com/$newFull", kb_back());
         return;
     }
-    $sid = $created['service']['id'] ?? ($created['id'] ?? null);
 
     $s = load_state();
-    $s[$chat] = ['step' => 'idle', 'service_id' => $sid];
+    $s[$chat] = ['step' => 'idle', 'service_id' => $sid, 'service_acct' => $usedAcct];
     save_state($s);
+    if ($acctSel === 'auto') remember_auto_account($usedAcct);
+
+    $acctNote = count($RENDER_ACCOUNTS) > 1 ? "🔀 Account: <code>" . esc(account_name($usedAcct)) . "</code>\n" : '';
 
     say($chat,
         "🎉 <b>All done!</b>\n" . rule() . "\n" .
         "🧩 Template: <code>" . esc($src) . "</code> <i>(untouched)</i>\n" .
         "📦 Repo: <code>" . esc($newFull) . "</code>\n" .
-        "🏷 Service: <code>" . esc($svcName) . "</code>\n" .
+        $acctNote .
         rule() . "\n" .
         "⏱ The first build takes roughly <b>2–5 minutes</b>.\n\n" .
         "<i>Tap Check status to watch it. When it turns ✅ Live, a link to your site appears.</i>",
-        [[['text' => '📊 Check status', 'callback_data' => "act:status:$sid"],
-          ['text' => '📜 Logs', 'callback_data' => "act:logs:$sid"]],
+        [[['text' => '📊 Check status', 'callback_data' => "act:status:$usedAcct:$sid"],
+          ['text' => '📜 Logs', 'callback_data' => "act:logs:$usedAcct:$sid"]],
          [['text' => '📦 Open on GitHub', 'url' => "https://github.com/$newFull"]],
          [['text' => '🏠 Main menu', 'callback_data' => 'nav:menu']]]);
 }
 
 // ============================================================
-//  15. STATUS & LOGS
+//  16. STATUS & LOGS
 // ============================================================
-function show_status($chat, $sid = null) {
-    global $STATUS_INFO;
+function show_status($chat, $sid = null, $acctIdx = null) {
+    global $STATUS_INFO, $RENDER_ACCOUNTS;
     $s   = load_state();
     $sid = $sid ?: ($s[$chat]['service_id'] ?? null);
+    $acctIdx = $acctIdx !== null ? $acctIdx : ($s[$chat]['service_acct'] ?? 0);
     if (!$sid) {
         out($chat, "🤷 <b>Nothing to show yet</b>\n\nI'm not watching any service right now.\n" .
                    "<i>Open 🗂 My sites and pick one, or start a new deployment.</i>", kb_main());
         return;
     }
 
-    [$cs, $svc]  = rnd('GET', "/services/$sid");
-    [, $deploys] = rnd('GET', "/services/$sid/deploys?limit=1");
+    [$cs, $svc]  = rnd('GET', "/services/$sid", null, $acctIdx);
+    [, $deploys] = rnd('GET', "/services/$sid/deploys?limit=1", null, $acctIdx);
     if ($cs !== 200) {
         out($chat, "❌ <b>Couldn't reach that service</b> (HTTP " . esc($cs) . ").\n" .
                    "<i>It may have been deleted. Try 🗂 My sites.</i>", kb_back());
@@ -896,8 +1444,9 @@ function show_status($chat, $sid = null) {
     $susp   = ($svc['suspended'] ?? '') === 'suspended';
     $commit = $d['commit']['message'] ?? null;
     $when   = $d['finishedAt'] ?? ($d['createdAt'] ?? null);
+    $acctNote = count($RENDER_ACCOUNTS) > 1 ? "🔀 <i>" . esc(account_name($acctIdx)) . "</i>\n" : '';
 
-    $txt  = "📊 <b>" . esc($svc['name'] ?? $sid) . "</b>\n" . rule() . "\n";
+    $txt  = "📊 <b>" . esc($svc['name'] ?? $sid) . "</b>\n" . $acctNote . rule() . "\n";
     $txt .= "$emo <b>" . esc(ucfirst(str_replace('_', ' ', $status))) . "</b>\n";
     $txt .= "<i>" . esc($meaning) . "</i>\n\n";
     $txt .= $susp ? "⏸ Service is <b>stopped</b>\n" : "▶️ Service is <b>active</b>\n";
@@ -913,32 +1462,34 @@ function show_status($chat, $sid = null) {
     }
     $txt .= "\n<i>Checked at " . date('g:i:s A') . "</i>";
 
-    $rows = [[['text' => '🔄 Refresh', 'callback_data' => "act:status:$sid"],
-              ['text' => '📜 Logs',    'callback_data' => "act:logs:$sid"]]];
+    $rows = [[['text' => '🔄 Refresh', 'callback_data' => "act:status:$acctIdx:$sid"],
+              ['text' => '📜 Logs',    'callback_data' => "act:logs:$acctIdx:$sid"]]];
     if ($url) $rows[] = [['text' => '🌐 Open the site', 'url' => $url]];
-    $rows[] = [['text' => '⚙️ Manage', 'callback_data' => "svc:$sid"],
+    $rows[] = [['text' => '⚙️ Manage', 'callback_data' => "svc:$acctIdx:$sid"],
                ['text' => '🏠 Menu',   'callback_data' => 'nav:menu']];
     out($chat, $txt, $rows);
 }
 
-function show_logs($chat, $sid = null) {
-    global $RENDER_OWNER_ID;
+function show_logs($chat, $sid = null, $acctIdx = null) {
     $s   = load_state();
     $sid = $sid ?: ($s[$chat]['service_id'] ?? null);
+    $acctIdx = $acctIdx !== null ? $acctIdx : ($s[$chat]['service_acct'] ?? 0);
     if (!$sid) {
         out($chat, "🤷 <b>No service selected</b>\n\n<i>Pick one from 🗂 My sites first.</i>", kb_main());
         return;
     }
+    $acct = account($acctIdx);
+    if (!$acct) { out($chat, "⚠️ That Render account isn't configured anymore.", kb_back()); return; }
 
     $q = http_build_query([
-        'ownerId' => $RENDER_OWNER_ID, 'resource' => [$sid],
+        'ownerId' => $acct['owner_id'], 'resource' => [$sid],
         'limit' => 40, 'direction' => 'backward',
     ]);
-    [$c, $logs] = rnd('GET', "/logs?$q");
+    [$c, $logs] = rnd('GET', "/logs?$q", null, $acctIdx);
     if ($c !== 200) {
         out($chat, "❌ <b>Couldn't fetch the logs</b> (HTTP " . esc($c) . ").\n" .
                    "<i>Render sometimes rate-limits this — wait a moment and retry.</i>",
-            [[['text' => '🔄 Try again', 'callback_data' => "act:logs:$sid"]],
+            [[['text' => '🔄 Try again', 'callback_data' => "act:logs:$acctIdx:$sid"]],
              [['text' => '🏠 Menu', 'callback_data' => 'nav:menu']]]);
         return;
     }
@@ -956,25 +1507,36 @@ function show_logs($chat, $sid = null) {
     out($chat,
         "📜 <b>Recent logs</b>\n<i>Newest lines at the bottom.</i>\n\n" .
         "<pre>" . esc($body) . "</pre>",
-        [[['text' => '🔄 Refresh', 'callback_data' => "act:logs:$sid"],
-          ['text' => '📊 Status',  'callback_data' => "act:status:$sid"]],
+        [[['text' => '🔄 Refresh', 'callback_data' => "act:logs:$acctIdx:$sid"],
+          ['text' => '📊 Status',  'callback_data' => "act:status:$acctIdx:$sid"]],
          [['text' => '🏠 Menu', 'callback_data' => 'nav:menu']]]);
 }
 
 // ============================================================
-//  16. SITES & REPOS
+//  17. SITES & REPOS
 // ============================================================
-function list_services($chat, $page = 0) {
-    global $PAGE_SIZE;
-    [$c, $svcs] = render_services();
+/** $acctSel is an account index, or 'all' to merge every account together. */
+function list_services($chat, $page = 0, $acctSel = 0) {
+    global $PAGE_SIZE, $RENDER_ACCOUNTS;
+
+    if ($acctSel === 'all') {
+        $svcs = render_services_all();
+        $c = 200;
+    } else {
+        [$c, $svcs] = render_services((int)$acctSel);
+    }
+
     if ($c !== 200) {
         out($chat, "❌ <b>Couldn't load your services</b> (HTTP " . esc($c) . ").\n" .
                    "<i>Run /check to test the Render connection.</i>", kb_back());
         return;
     }
     if (!$svcs) {
-        out($chat, "📭 <b>No sites yet</b>\n\nYou don't have any web services in this Render workspace.\n" .
-                   "<i>Start with a new deployment.</i>", kb_main());
+        out($chat, "📭 <b>No sites yet</b>\n\nNo web services found there.\n" .
+                   "<i>Start with a new deployment, or check a different account.</i>",
+            [[['text' => '🚀 New deployment', 'callback_data' => 'nav:newhost']],
+             [['text' => '🔀 Try another account', 'callback_data' => 'nav:sites']],
+             kb_back()[0]]);
         return;
     }
 
@@ -985,16 +1547,21 @@ function list_services($chat, $page = 0) {
     $rows = [];
     foreach (array_slice($svcs, $page * $PAGE_SIZE, $PAGE_SIZE) as $svc) {
         $icon = (($svc['suspended'] ?? '') === 'suspended') ? '⏸' : '🟢';
-        $rows[] = [['text' => "$icon " . $svc['name'], 'callback_data' => 'svc:' . $svc['id']]];
+        $acctIdx = $svc['_acct'] ?? (is_numeric($acctSel) ? (int)$acctSel : 0);
+        $label = "$icon " . $svc['name'];
+        if ($acctSel === 'all' && count($RENDER_ACCOUNTS) > 1) $label .= "  ·  " . account_name($acctIdx);
+        $rows[] = [['text' => $label, 'callback_data' => "svc:$acctIdx:" . $svc['id']]];
     }
     $nav = [];
-    if ($page > 0)          $nav[] = ['text' => '◀️ Back', 'callback_data' => 'svcpg:' . ($page - 1)];
+    if ($page > 0)          $nav[] = ['text' => '◀️ Back', 'callback_data' => "svcpg:$acctSel:" . ($page - 1)];
     if ($pages > 1)         $nav[] = ['text' => '📄 ' . ($page + 1) . " / $pages", 'callback_data' => 'noop'];
-    if ($page < $pages - 1) $nav[] = ['text' => 'Next ▶️', 'callback_data' => 'svcpg:' . ($page + 1)];
+    if ($page < $pages - 1) $nav[] = ['text' => 'Next ▶️', 'callback_data' => "svcpg:$acctSel:" . ($page + 1)];
     if ($nav) $rows[] = $nav;
+    if (count($RENDER_ACCOUNTS) > 1) $rows[] = [['text' => '🔀 Switch account', 'callback_data' => 'nav:sites']];
     $rows[] = [['text' => '🏠 Main menu', 'callback_data' => 'nav:menu']];
 
-    out($chat, "🗂 <b>My sites</b>  <i>($total)</i>\n" . rule() . "\n" .
+    $where = ($acctSel === 'all') ? 'all accounts' : account_name($acctSel);
+    out($chat, "🗂 <b>My sites</b>  <i>($total · " . esc($where) . ")</i>\n" . rule() . "\n" .
                "🟢 running   ⏸ stopped\n\n<i>Tap a site to redeploy, restart, stop or delete it.</i>", $rows);
 }
 
@@ -1024,19 +1591,21 @@ function list_clones($chat) {
         kb_main());
 }
 
-function service_menu($chat, $sid) {
-    [$c, $svc] = rnd('GET', "/services/$sid");
+function service_menu($chat, $acctIdx, $sid) {
+    [$c, $svc] = rnd('GET', "/services/$sid", null, $acctIdx);
     if ($c !== 200) {
         out($chat, "❌ <b>Service not found</b> (HTTP " . esc($c) . ").\n<i>It may have been deleted.</i>", kb_back());
         return;
     }
-    $s = load_state(); $s[$chat]['service_id'] = $sid; save_state($s);
+    $s = load_state(); $s[$chat]['service_id'] = $sid; $s[$chat]['service_acct'] = $acctIdx; save_state($s);
 
+    global $RENDER_ACCOUNTS;
     $susp = ($svc['suspended'] ?? '') === 'suspended';
     $url  = $svc['serviceDetails']['url'] ?? null;
     $repo = $svc['repo'] ?? null;
 
     $txt  = "⚙️ <b>" . esc($svc['name'] ?? $sid) . "</b>\n" . rule() . "\n";
+    if (count($RENDER_ACCOUNTS) > 1) $txt .= "🔀 Account: <code>" . esc(account_name($acctIdx)) . "</code>\n";
     $txt .= $susp ? "⏸ <b>Stopped</b> — the site is offline\n" : "🟢 <b>Running</b>\n";
     $txt .= "🌿 Branch: <code>" . esc($svc['branch'] ?? '?') . "</code>\n";
     if ($repo) $txt .= "📦 " . esc($repo) . "\n";
@@ -1047,14 +1616,14 @@ function service_menu($chat, $sid) {
             "Stop = take it offline without deleting anything.</i>";
 
     $rows = [
-        [['text' => '📊 Status', 'callback_data' => "act:status:$sid"],
-         ['text' => '📜 Logs',   'callback_data' => "act:logs:$sid"]],
-        [['text' => '🚀 Redeploy', 'callback_data' => "act:redeploy:$sid"],
-         ['text' => '♻️ Restart',  'callback_data' => "act:restart:$sid"]],
-        $susp ? [['text' => '▶️ Start again', 'callback_data' => "act:resume:$sid"]]
-              : [['text' => '⏸ Stop the site', 'callback_data' => "act:suspend:$sid"]],
-        [['text' => '🗑 Delete service', 'callback_data' => "act:delask:$sid"]],
-        [['text' => '↩️ All sites', 'callback_data' => 'svcpg:0'],
+        [['text' => '📊 Status', 'callback_data' => "act:status:$acctIdx:$sid"],
+         ['text' => '📜 Logs',   'callback_data' => "act:logs:$acctIdx:$sid"]],
+        [['text' => '🚀 Redeploy', 'callback_data' => "act:redeploy:$acctIdx:$sid"],
+         ['text' => '♻️ Restart',  'callback_data' => "act:restart:$acctIdx:$sid"]],
+        $susp ? [['text' => '▶️ Start again', 'callback_data' => "act:resume:$acctIdx:$sid"]]
+              : [['text' => '⏸ Stop the site', 'callback_data' => "act:suspend:$acctIdx:$sid"]],
+        [['text' => '🗑 Delete service', 'callback_data' => "act:delask:$acctIdx:$sid"]],
+        [['text' => '↩️ All sites', 'callback_data' => 'nav:sites'],
          ['text' => '🏠 Menu',      'callback_data' => 'nav:menu']],
     ];
     if ($url)  array_splice($rows, 4, 0, [[['text' => '🌐 Open the site', 'url' => $url]]]);
@@ -1062,27 +1631,27 @@ function service_menu($chat, $sid) {
     out($chat, $txt, $rows);
 }
 
-function service_action($chat, $action, $sid) {
-    $s = load_state(); $s[$chat]['service_id'] = $sid; save_state($s);
-    $back = [['text' => '↩️ Back', 'callback_data' => "svc:$sid"]];
+function service_action($chat, $action, $acctIdx, $sid) {
+    $s = load_state(); $s[$chat]['service_id'] = $sid; $s[$chat]['service_acct'] = $acctIdx; save_state($s);
+    $back = [['text' => '↩️ Back', 'callback_data' => "svc:$acctIdx:$sid"]];
 
     switch ($action) {
-        case 'status': show_status($chat, $sid); return;
-        case 'logs':   show_logs($chat, $sid);   return;
+        case 'status': show_status($chat, $sid, $acctIdx); return;
+        case 'logs':   show_logs($chat, $sid, $acctIdx);   return;
 
         case 'redeploy':
             toast('Starting a new deploy…');
-            [$c] = rnd('POST', "/services/$sid/deploys", []);
+            [$c] = rnd('POST', "/services/$sid/deploys", [], $acctIdx);
             out($chat, $c < 300
                 ? "🚀 <b>Redeploy started</b>\n\nRender is rebuilding from the latest commit.\n" .
                   "<i>Usually 2–5 minutes.</i>"
                 : "❌ <b>Redeploy failed</b> (HTTP " . esc($c) . ").",
-                [[['text' => '📊 Watch status', 'callback_data' => "act:status:$sid"]], $back]);
+                [[['text' => '📊 Watch status', 'callback_data' => "act:status:$acctIdx:$sid"]], $back]);
             return;
 
         case 'restart':
             toast('Restarting…');
-            [$c] = rnd('POST', "/services/$sid/restart", []);
+            [$c] = rnd('POST', "/services/$sid/restart", [], $acctIdx);
             out($chat, $c < 300
                 ? "♻️ <b>Restarted</b>\n\nSame build, fresh process. Back up in a few seconds."
                 : "❌ <b>Restart failed</b> (HTTP " . esc($c) . ").", [$back]);
@@ -1090,7 +1659,7 @@ function service_action($chat, $action, $sid) {
 
         case 'suspend':
             toast('Stopping…');
-            [$c] = rnd('POST', "/services/$sid/suspend", []);
+            [$c] = rnd('POST', "/services/$sid/suspend", [], $acctIdx);
             out($chat, $c < 300
                 ? "⏸ <b>Site stopped</b>\n\nIt's offline now, but nothing was deleted — " .
                   "you can start it again any time."
@@ -1099,42 +1668,42 @@ function service_action($chat, $action, $sid) {
 
         case 'resume':
             toast('Starting…');
-            [$c] = rnd('POST', "/services/$sid/resume", []);
+            [$c] = rnd('POST', "/services/$sid/resume", [], $acctIdx);
             out($chat, $c < 300
                 ? "▶️ <b>Starting up</b>\n\nGive it a minute, then check the status."
                 : "❌ <b>Couldn't start it</b> (HTTP " . esc($c) . ").",
-                [[['text' => '📊 Watch status', 'callback_data' => "act:status:$sid"]], $back]);
+                [[['text' => '📊 Watch status', 'callback_data' => "act:status:$acctIdx:$sid"]], $back]);
             return;
 
         case 'delask':
-            [, $svc] = rnd('GET', "/services/$sid");
+            [, $svc] = rnd('GET', "/services/$sid", null, $acctIdx);
             out($chat, "⚠️ <b>Delete this service?</b>\n" . rule() . "\n" .
                        "🏷 <b>" . esc($svc['name'] ?? $sid) . "</b>\n\n" .
                        "This removes the site from Render permanently. It cannot be undone.\n\n" .
                        "ℹ️ <i>The GitHub repo stays — only the Render service is removed.</i>",
-                [[['text' => '🗑 Yes, delete it', 'callback_data' => "act:delyes:$sid"]],
-                 [['text' => '↩️ No, keep it',    'callback_data' => "svc:$sid"]]]);
+                [[['text' => '🗑 Yes, delete it', 'callback_data' => "act:delyes:$acctIdx:$sid"]],
+                 [['text' => '↩️ No, keep it',    'callback_data' => "svc:$acctIdx:$sid"]]]);
             return;
 
         case 'delyes':
             toast('Deleting…');
-            [$c] = rnd('DELETE', "/services/$sid");
+            [$c] = rnd('DELETE', "/services/$sid", null, $acctIdx);
             if ($c < 300) {
                 $st = load_state();
-                if (($st[$chat]['service_id'] ?? '') === $sid) unset($st[$chat]['service_id']);
+                if (($st[$chat]['service_id'] ?? '') === $sid) { unset($st[$chat]['service_id']); unset($st[$chat]['service_acct']); }
                 save_state($st);
             }
             out($chat, $c < 300
                 ? "🗑 <b>Service deleted</b>\n\n<i>The GitHub repo is still there if you need it.</i>"
                 : "❌ <b>Delete failed</b> (HTTP " . esc($c) . ").",
-                [[['text' => '🗂 My sites', 'callback_data' => 'svcpg:0'],
+                [[['text' => '🗂 My sites', 'callback_data' => 'nav:sites'],
                   ['text' => '🏠 Menu',     'callback_data' => 'nav:menu']]]);
             return;
     }
 }
 
 // ============================================================
-//  17. WEBHOOK ENTRY POINT
+//  18. WEBHOOK ENTRY POINT
 // ============================================================
 $update = json_decode(file_get_contents('php://input'), true);
 if (!$update) { http_response_code(200); echo 'ok'; exit; }
@@ -1159,20 +1728,40 @@ if ((string)$chat !== (string)$ADMIN_CHAT_ID) {
     http_response_code(200); echo 'ok'; exit;
 }
 
+ensure_bot_commands();
+
 // ---------- BUTTON PRESSES ----------
 if ($cb !== null) {
     if ($cb === 'noop') { toast(); }
 
     elseif (strpos($cb, 'nav:') === 0) {
         $w = substr($cb, 4); toast();
-        if ($w === 'menu')    show_menu($chat);
-        if ($w === 'help')    show_help($chat);
-        if ($w === 'check')   show_check($chat);
-        if ($w === 'status')  show_status($chat);
-        if ($w === 'logs')    show_logs($chat);
-        if ($w === 'sites')   list_services($chat, 0);
-        if ($w === 'repos')   list_clones($chat);
-        if ($w === 'newhost') { reset_flow($chat); list_repos($chat, 0); }
+        if ($w === 'menu')     show_menu($chat);
+        if ($w === 'help')     show_help($chat);
+        if ($w === 'check')    show_check($chat);
+        if ($w === 'status')   show_status($chat);
+        if ($w === 'logs')     show_logs($chat);
+        if ($w === 'sites')    ask_account($chat, 'sites');
+        if ($w === 'repos')    list_clones($chat);
+        if ($w === 'accounts') show_accounts($chat);
+        if ($w === 'addaccount')    ask_add_account($chat);
+        if ($w === 'removeaccount') ask_remove_account($chat);
+        if ($w === 'newhost')  { reset_flow($chat); list_repos($chat, 0); }
+    }
+
+    elseif (strpos($cb, 'addacct_owner:') === 0) { toast(); pick_add_account_owner($chat, (int)substr($cb, 14)); }
+    elseif ($cb === 'addacct_defname') {
+        toast();
+        $s = load_state();
+        $name = 'Account ' . (count($GLOBALS['RENDER_ACCOUNTS']) + 1);
+        finish_add_account($chat, $name);
+    }
+    elseif (strpos($cb, 'rmacct:') === 0) { toast(); do_remove_account($chat, (int)substr($cb, 7)); }
+
+    elseif (strpos($cb, 'acctsel:') === 0) {
+        toast();
+        $p = explode(':', $cb, 3);          // acctsel:<purpose>:<idx|all>
+        route_after_account($chat, $p[1], is_numeric($p[2]) ? (int)$p[2] : $p[2]);
     }
 
     elseif (strpos($cb, 'repopg:') === 0) {
@@ -1196,10 +1785,12 @@ if ($cb !== null) {
         if (!$picked) {
             out($chat, "⚠️ <b>That list expired</b>\n\n<i>Run /newhost to start again.</i>", kb_main());
         } else {
+            global $DEFAULT_PRIVATE;
             $s[$chat] = [
                 'step' => 'repo_name', 'src_repo' => $picked['full'], 'src_branch' => $picked['branch'],
-                'private' => $DEFAULT_PRIVATE, 'field_idx' => 0, 'values' => [],
+                'private' => $DEFAULT_PRIVATE, 'acct_sel' => 'auto', 'field_idx' => 0, 'values' => [],
                 'service_id' => $s[$chat]['service_id'] ?? null,
+                'service_acct' => $s[$chat]['service_acct'] ?? null,
                 'repo_cache' => $s[$chat]['repo_cache'],
             ];
             save_state($s);
@@ -1215,6 +1806,16 @@ if ($cb !== null) {
         ask_repo_name($chat);
     }
 
+    elseif (strpos($cb, 'setacct:') === 0) {
+        $sel = substr($cb, 8);
+        $s = load_state();
+        $s[$chat]['acct_sel'] = $sel;
+        save_state($s);
+        toast($sel === 'auto' ? 'Auto selected' : ('Selected ' . account_name($sel)));
+        ask_deploy_account($chat);
+    }
+    elseif ($cb === 'acctdone') { toast(); ask_next_field($chat); }
+
     elseif ($cb === 'skip')   { skip_field($chat); }
     elseif ($cb === 'redo')   {
         toast('Starting the settings over');
@@ -1228,11 +1829,18 @@ if ($cb !== null) {
         out($chat, "❌ <b>Cancelled</b>\n\nNo repo was created and nothing was changed.", kb_main());
     }
 
-    elseif (strpos($cb, 'svcpg:') === 0) { toast(); list_services($chat, (int)substr($cb, 6)); }
-    elseif (strpos($cb, 'svc:') === 0)   { toast(); service_menu($chat, substr($cb, 4)); }
+    elseif (strpos($cb, 'svcpg:') === 0) {
+        toast(); $p = explode(':', $cb, 3);       // svcpg:<acctSel>:<page>
+        $acctSel = is_numeric($p[1]) ? (int)$p[1] : $p[1];
+        list_services($chat, (int)($p[2] ?? 0), $acctSel);
+    }
+    elseif (strpos($cb, 'svc:') === 0) {
+        toast(); $p = explode(':', $cb, 3);       // svc:<acctIdx>:<sid>
+        service_menu($chat, (int)$p[1], $p[2] ?? '');
+    }
     elseif (strpos($cb, 'act:') === 0) {
-        $p = explode(':', $cb, 3);
-        service_action($chat, $p[1], $p[2] ?? '');
+        $p = explode(':', $cb, 4);                // act:<action>:<acctIdx>:<sid>
+        service_action($chat, $p[1], (int)($p[2] ?? 0), $p[3] ?? '');
         toast();
     }
 
@@ -1252,11 +1860,17 @@ switch ($cmd) {
         show_help($chat);        http_response_code(200); echo 'ok'; exit;
     case '/check':
         show_check($chat);       http_response_code(200); echo 'ok'; exit;
+    case '/accounts':
+        show_accounts($chat);    http_response_code(200); echo 'ok'; exit;
+    case '/addaccount':
+        ask_add_account($chat);  http_response_code(200); echo 'ok'; exit;
+    case '/removeaccount':
+        ask_remove_account($chat); http_response_code(200); echo 'ok'; exit;
     case '/newhost':
         reset_flow($chat); list_repos($chat, 0);
         http_response_code(200); echo 'ok'; exit;
     case '/sites':
-        list_services($chat, 0); http_response_code(200); echo 'ok'; exit;
+        ask_account($chat, 'sites'); http_response_code(200); echo 'ok'; exit;
     case '/repos':
         list_clones($chat);      http_response_code(200); echo 'ok'; exit;
     case '/status':
@@ -1272,6 +1886,15 @@ switch ($cmd) {
 if ($step === 'repo_search')     { list_repos($chat, 0, $text); }
 elseif ($step === 'repo_name')   { set_repo_name($chat, $text); }
 elseif ($step === 'collect')     { take_field($chat, $text, $msg_id); }
+elseif ($step === 'add_acct_key')  { take_add_account_key($chat, $text, $msg_id); }
+elseif ($step === 'add_acct_name') {
+    $name = trim((string)$text);
+    if ($name === '') { say($chat, "⚠️ Type a short label, or tap Use suggested above."); }
+    else { finish_add_account($chat, $name); }
+}
+elseif ($step === 'add_acct_owner') {
+    say($chat, "☝️ Tap one of the workspaces above.");
+}
 elseif ($step === 'review')      {
     say($chat, "☝️ Everything is ready — tap <b>✅ Create &amp; deploy</b> in the message above, " .
                "or send /cancel to back out.");
