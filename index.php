@@ -66,38 +66,80 @@ $PAGE_SIZE      = 8;     // buttons per page
 $MAX_COPY_FILES = 300;   // ceiling for the fallback copy method
 
 /**
- * Render accounts this bot can deploy to / manage — see the header
- * comment above for the RENDER_ACCOUNTS format. owner_id is required
- * here (no silent auto-lookup) so a bad/misread env var fails loudly in
- * /check instead of quietly falling back to a single account.
+ * Render accounts this bot can deploy to / manage.
+ *
+ * PRIMARY method — numbered environment variables, one per account.
+ * Simple key/value pairs, nothing to paste as JSON, nothing that can
+ * silently break from curly quotes or a stray character:
+ *
+ *   RENDER_NAME1=Rent 1
+ *   RENDER_KEY1=rnd_xxxxxxxxxxxxx
+ *   RENDER_OWNER1=tea-xxxxxxxxxxxx
+ *
+ *   RENDER_NAME2=Rent2
+ *   RENDER_KEY2=rnd_yyyyyyyyyyyyy
+ *   RENDER_OWNER2=tea-yyyyyyyyyyyy
+ *
+ * Add a 3rd, 4th, etc the same way — just increment the number. Only
+ * RENDER_KEY<n> is required; RENDER_NAME<n> defaults to "Account n" and
+ * RENDER_OWNER<n> is looked up automatically if you leave it out.
+ *
+ * ALTERNATE method — RENDER_ACCOUNTS as one JSON array — still
+ * supported if you prefer it, checked if no numbered vars are found.
+ *
+ * FALLBACK — plain RENDER_API_KEY / RENDER_OWNER_ID as a single
+ * "Account 1", for old setups that predate multi-account support.
  */
 $RENDER_ACCOUNTS = [];
-$rawAccounts = getenv('RENDER_ACCOUNTS');
-$RENDER_ACCOUNTS_RAW_LEN   = $rawAccounts !== false ? strlen($rawAccounts) : -1;   // -1 = env var not present at all
-$RENDER_ACCOUNTS_JSON_ERR  = '';
-if ($rawAccounts) {
-    // Defensive cleanup: copy-pasting from some apps/keyboards swaps
-    // straight quotes for curly ones, which silently breaks JSON.
-    $cleaned = str_replace(['“', '”', '‘', '’'], ['"', '"', "'", "'"], trim($rawAccounts));
-    $parsed = json_decode($cleaned, true);
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        $RENDER_ACCOUNTS_JSON_ERR = json_last_error_msg();
-    } elseif (is_array($parsed)) {
-        foreach ($parsed as $i => $a) {
-            $key = $a['key'] ?? $a['api_key'] ?? $a['RENDER_API_KEY'] ?? '';
-            $oid = $a['owner_id'] ?? $a['ownerId'] ?? $a['RENDER_OWNER_ID'] ?? '';
-            if ($key === '') continue;
-            $RENDER_ACCOUNTS[] = [
-                'name' => $a['name'] ?? ('Account ' . ($i + 1)),
-                'key' => $key, 'owner_id' => $oid, 'email' => $a['email'] ?? '',
-            ];
+$RENDER_ACCOUNTS_SOURCE = 'none';
+
+for ($i = 1; $i <= 20; $i++) {
+    $key = getenv("RENDER_KEY$i");
+    if ($key === false || $key === '') $key = getenv("RENDER_API_KEY$i");
+    if ($key === false || $key === '') continue;
+    $oid = getenv("RENDER_OWNER$i");
+    if ($oid === false) $oid = getenv("RENDER_OWNER_ID$i");
+    $name = getenv("RENDER_NAME$i");
+    $RENDER_ACCOUNTS[] = [
+        'name' => ($name !== false && $name !== '') ? $name : "Account $i",
+        'key' => $key, 'owner_id' => ($oid !== false ? $oid : ''), 'email' => '',
+    ];
+}
+if ($RENDER_ACCOUNTS) $RENDER_ACCOUNTS_SOURCE = 'numbered';
+
+$RENDER_ACCOUNTS_RAW_LEN  = -1;   // -1 = RENDER_ACCOUNTS env var not present at all
+$RENDER_ACCOUNTS_JSON_ERR = '';
+if (!$RENDER_ACCOUNTS) {
+    $rawAccounts = getenv('RENDER_ACCOUNTS');
+    $RENDER_ACCOUNTS_RAW_LEN = $rawAccounts !== false ? strlen($rawAccounts) : -1;
+    if ($rawAccounts) {
+        // Defensive cleanup: copy-pasting from some apps/keyboards swaps
+        // straight quotes for curly ones, which silently breaks JSON.
+        $cleaned = str_replace(['“', '”', '‘', '’'], ['"', '"', "'", "'"], trim($rawAccounts));
+        $parsed = json_decode($cleaned, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            $RENDER_ACCOUNTS_JSON_ERR = json_last_error_msg();
+        } elseif (is_array($parsed)) {
+            foreach ($parsed as $i => $a) {
+                $key = $a['key'] ?? $a['api_key'] ?? $a['RENDER_API_KEY'] ?? '';
+                $oid = $a['owner_id'] ?? $a['ownerId'] ?? $a['RENDER_OWNER_ID'] ?? '';
+                if ($key === '') continue;
+                $RENDER_ACCOUNTS[] = [
+                    'name' => $a['name'] ?? ('Account ' . ($i + 1)),
+                    'key' => $key, 'owner_id' => $oid, 'email' => $a['email'] ?? '',
+                ];
+            }
         }
     }
+    if ($RENDER_ACCOUNTS) $RENDER_ACCOUNTS_SOURCE = 'json';
 }
 if (!$RENDER_ACCOUNTS) {
     $fk = getenv('RENDER_API_KEY');
     $fo = getenv('RENDER_OWNER_ID');
-    if ($fk) $RENDER_ACCOUNTS[] = ['name' => 'Account 1 (fallback)', 'key' => $fk, 'owner_id' => $fo ?: '', 'email' => ''];
+    if ($fk) {
+        $RENDER_ACCOUNTS[] = ['name' => 'Account 1 (fallback)', 'key' => $fk, 'owner_id' => $fo ?: '', 'email' => ''];
+        $RENDER_ACCOUNTS_SOURCE = 'fallback';
+    }
 }
 foreach ($RENDER_ACCOUNTS as $i => $a) {
     if (!empty($a['owner_id'])) continue;
@@ -620,21 +662,22 @@ function show_help($chat) {
         "Nothing is created until you tap <b>Create &amp; deploy</b> in the last step. " .
         "You can back out with ❌ Cancel at any point.\n\n" .
         "<b>Render accounts</b>\n" .
-        "You currently have <b>" . count($RENDER_ACCOUNTS) . "</b> connected. Add or remove accounts " .
-        "by editing <code>RENDER_ACCOUNTS</code> in this bot's Render → Environment tab — it's a " .
-        "JSON list:\n\n" .
-        "<pre>[\n  {\"name\":\"Main\",\"key\":\"rnd_xxx\",\"owner_id\":\"tea-aaa\"},\n  {\"name\":\"Backup\",\"key\":\"rnd_yyy\",\"owner_id\":\"tea-bbb\"}\n]</pre>\n" .
-        "<code>key</code> is required (Full Access, not Read Only — from Render → Account Settings → " .
-        "API Keys). <code>owner_id</code> is optional — the bot looks it up automatically if you " .
-        "leave it out — but including it yourself is faster and easier to double-check. Find it via " .
-        "Render → Account Settings → the Workspace/Owner ID shown there (starts with <code>tea-</code> " .
-        "or <code>usr-</code>).\n\n" .
-        "💡 <b>Editing the raw JSON on a phone is fiddly</b> — quotes sometimes turn " .
-        "\u201Ccurly\u201D instead of straight, which silently breaks it. Type it fresh instead of " .
-        "copy-pasting from a notes app if something looks off, and run <code>/check</code> after " .
-        "saving — it tells you exactly whether the JSON parsed and how many accounts it found.\n\n" .
-        "Save the variable, let this bot redeploy, and every account in the list shows up here " .
-        "immediately — in <code>/accounts</code>, <code>/sites</code>, and the deploy wizard.\n\n" .
+        "You currently have <b>" . count($RENDER_ACCOUNTS) . "</b> connected. Add accounts in this " .
+        "bot's Render → Environment tab, one set of variables per account — just plain key/value " .
+        "pairs, nothing to paste as JSON:\n\n" .
+        "<pre>RENDER_NAME1=Rent 1\nRENDER_KEY1=rnd_xxxxxxxxxxxxx\nRENDER_OWNER1=tea-xxxxxxxxxxxx\n\nRENDER_NAME2=Rent2\nRENDER_KEY2=rnd_yyyyyyyyyyyyy\nRENDER_OWNER2=tea-yyyyyyyyyyyy</pre>\n" .
+        "For a 3rd account use <code>RENDER_NAME3</code> / <code>RENDER_KEY3</code> / " .
+        "<code>RENDER_OWNER3</code>, and so on — just increment the number.\n\n" .
+        "Only <code>RENDER_KEY&lt;n&gt;</code> (Full Access, from Render → Account Settings → API " .
+        "Keys) is required. <code>RENDER_NAME&lt;n&gt;</code> defaults to \"Account n\" if you skip " .
+        "it, and <code>RENDER_OWNER&lt;n&gt;</code> is looked up automatically if you leave it out — " .
+        "but setting it yourself is more reliable, from Render → Account Settings → the Workspace/" .
+        "Owner ID (starts with <code>tea-</code> or <code>usr-</code>) <b>while logged into that " .
+        "specific account</b>, since it's different for every account.\n\n" .
+        "Save, let this bot redeploy, then run <code>/check</code> — it shows exactly which source " .
+        "supplied your accounts and how many it found, so a typo doesn't stay invisible.\n\n" .
+        "<i>(A single RENDER_ACCOUNTS JSON array still works too if you prefer it, checked when no " .
+        "numbered variables are found.)</i>\n\n" .
         "No \"limit\" setting on purpose — Render enforces its own plan limits. Everywhere you view " .
         "sites you pick an account first (or 🌐 All accounts to see everything together). When " .
         "deploying, 🎲 <b>Auto</b> is the default: it rotates across your accounts, and the moment " .
@@ -659,7 +702,7 @@ function show_help($chat) {
 /** Quick health check so a failure later is easier to diagnose. */
 function show_check($chat) {
     global $GITHUB_OWNER, $RENDER_ACCOUNTS, $RENDER_REGION, $CONFIG_PATH, $ADMIN_CHAT_ID;
-    global $RENDER_ACCOUNTS_RAW_LEN, $RENDER_ACCOUNTS_JSON_ERR;
+    global $RENDER_ACCOUNTS_RAW_LEN, $RENDER_ACCOUNTS_JSON_ERR, $RENDER_ACCOUNTS_SOURCE;
     out($chat, "🩺 Running checks…");
 
     $lines = [];
@@ -674,21 +717,23 @@ function show_check($chat) {
                    "</code> but the token belongs to <code>" . esc($me['login']) . "</code>";
     }
 
-    // Diagnostics for RENDER_ACCOUNTS specifically — helps spot a bad
-    // paste (curly quotes, missing bracket) instead of guessing blind.
-    if ($RENDER_ACCOUNTS_RAW_LEN === -1) {
-        $lines[] = "ℹ️ <b>RENDER_ACCOUNTS</b> — not set (using RENDER_API_KEY fallback if present)";
-    } elseif ($RENDER_ACCOUNTS_JSON_ERR !== '') {
+    // Diagnostics — which source actually supplied the accounts, so a
+    // silent mismatch (env var not really reaching PHP) is visible.
+    $sourceLabel = [
+        'numbered' => '✅ numbered vars (RENDER_KEY1, RENDER_KEY2, …)',
+        'json'     => '✅ RENDER_ACCOUNTS JSON',
+        'fallback' => '⚠️ RENDER_API_KEY / RENDER_OWNER_ID fallback (old single-account style)',
+        'none'     => '❌ none found',
+    ][$RENDER_ACCOUNTS_SOURCE] ?? $RENDER_ACCOUNTS_SOURCE;
+    $lines[] = "🔎 <b>Account source detected:</b> $sourceLabel";
+
+    if ($RENDER_ACCOUNTS_JSON_ERR !== '') {
         $lines[] = "❌ <b>RENDER_ACCOUNTS is set but invalid JSON</b> (" . esc($RENDER_ACCOUNTS_RAW_LEN) . " chars)\n" .
-                   "     <i>Error: " . esc($RENDER_ACCOUNTS_JSON_ERR) . "</i>\n" .
-                   "     <i>Common cause: curly “ ” quotes instead of straight \" \" from copy-paste, " .
-                   "or a missing closing bracket at the end.</i>";
-    } else {
-        $lines[] = "✅ <b>RENDER_ACCOUNTS</b> — valid JSON, " . esc($RENDER_ACCOUNTS_RAW_LEN) . " chars, " . count($RENDER_ACCOUNTS) . " account(s) parsed";
+                   "     <i>Error: " . esc($RENDER_ACCOUNTS_JSON_ERR) . "</i>";
     }
 
     if (!$RENDER_ACCOUNTS) {
-        $lines[] = "❌ <b>Render</b> — no account connected\n     <i>Set RENDER_ACCOUNTS in Environment, then send /help.</i>";
+        $lines[] = "❌ <b>Render</b> — no account connected\n     <i>Set RENDER_KEY1 (and optionally RENDER_NAME1/RENDER_OWNER1) in Environment, then send /help.</i>";
     } else {
         foreach ($RENDER_ACCOUNTS as $i => $a) {
             [$c2, $svcs] = render_services($i);
