@@ -67,16 +67,22 @@ $MAX_COPY_FILES = 300;   // ceiling for the fallback copy method
 
 /**
  * Render accounts this bot can deploy to / manage — see the header
- * comment above for the RENDER_ACCOUNTS format. Missing owner_id values
- * are filled in automatically further down, once render_owners_for_key()
- * is available (PHP hoists top-level function declarations, so calling
- * it before its textual definition is fine).
+ * comment above for the RENDER_ACCOUNTS format. owner_id is required
+ * here (no silent auto-lookup) so a bad/misread env var fails loudly in
+ * /check instead of quietly falling back to a single account.
  */
 $RENDER_ACCOUNTS = [];
 $rawAccounts = getenv('RENDER_ACCOUNTS');
+$RENDER_ACCOUNTS_RAW_LEN   = $rawAccounts !== false ? strlen($rawAccounts) : -1;   // -1 = env var not present at all
+$RENDER_ACCOUNTS_JSON_ERR  = '';
 if ($rawAccounts) {
-    $parsed = json_decode($rawAccounts, true);
-    if (is_array($parsed)) {
+    // Defensive cleanup: copy-pasting from some apps/keyboards swaps
+    // straight quotes for curly ones, which silently breaks JSON.
+    $cleaned = str_replace(['“', '”', '‘', '’'], ['"', '"', "'", "'"], trim($rawAccounts));
+    $parsed = json_decode($cleaned, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        $RENDER_ACCOUNTS_JSON_ERR = json_last_error_msg();
+    } elseif (is_array($parsed)) {
         foreach ($parsed as $i => $a) {
             $key = $a['key'] ?? $a['api_key'] ?? $a['RENDER_API_KEY'] ?? '';
             $oid = $a['owner_id'] ?? $a['ownerId'] ?? $a['RENDER_OWNER_ID'] ?? '';
@@ -91,7 +97,7 @@ if ($rawAccounts) {
 if (!$RENDER_ACCOUNTS) {
     $fk = getenv('RENDER_API_KEY');
     $fo = getenv('RENDER_OWNER_ID');
-    if ($fk) $RENDER_ACCOUNTS[] = ['name' => 'Account 1', 'key' => $fk, 'owner_id' => $fo ?: '', 'email' => ''];
+    if ($fk) $RENDER_ACCOUNTS[] = ['name' => 'Account 1 (fallback)', 'key' => $fk, 'owner_id' => $fo ?: '', 'email' => ''];
 }
 foreach ($RENDER_ACCOUNTS as $i => $a) {
     if (!empty($a['owner_id'])) continue;
@@ -617,9 +623,16 @@ function show_help($chat) {
         "You currently have <b>" . count($RENDER_ACCOUNTS) . "</b> connected. Add or remove accounts " .
         "by editing <code>RENDER_ACCOUNTS</code> in this bot's Render → Environment tab — it's a " .
         "JSON list:\n\n" .
-        "<pre>[\n  {\"name\":\"Main\",\"key\":\"rnd_xxx\"},\n  {\"name\":\"Backup\",\"key\":\"rnd_yyy\"}\n]</pre>\n" .
-        "Just the <code>key</code> is required (Full Access, not Read Only — from Render → Account " .
-        "Settings → API Keys). Owner ID and email are looked up automatically, no need to include them.\n\n" .
+        "<pre>[\n  {\"name\":\"Main\",\"key\":\"rnd_xxx\",\"owner_id\":\"tea-aaa\"},\n  {\"name\":\"Backup\",\"key\":\"rnd_yyy\",\"owner_id\":\"tea-bbb\"}\n]</pre>\n" .
+        "<code>key</code> is required (Full Access, not Read Only — from Render → Account Settings → " .
+        "API Keys). <code>owner_id</code> is optional — the bot looks it up automatically if you " .
+        "leave it out — but including it yourself is faster and easier to double-check. Find it via " .
+        "Render → Account Settings → the Workspace/Owner ID shown there (starts with <code>tea-</code> " .
+        "or <code>usr-</code>).\n\n" .
+        "💡 <b>Editing the raw JSON on a phone is fiddly</b> — quotes sometimes turn " .
+        "\u201Ccurly\u201D instead of straight, which silently breaks it. Type it fresh instead of " .
+        "copy-pasting from a notes app if something looks off, and run <code>/check</code> after " .
+        "saving — it tells you exactly whether the JSON parsed and how many accounts it found.\n\n" .
         "Save the variable, let this bot redeploy, and every account in the list shows up here " .
         "immediately — in <code>/accounts</code>, <code>/sites</code>, and the deploy wizard.\n\n" .
         "No \"limit\" setting on purpose — Render enforces its own plan limits. Everywhere you view " .
@@ -646,6 +659,7 @@ function show_help($chat) {
 /** Quick health check so a failure later is easier to diagnose. */
 function show_check($chat) {
     global $GITHUB_OWNER, $RENDER_ACCOUNTS, $RENDER_REGION, $CONFIG_PATH, $ADMIN_CHAT_ID;
+    global $RENDER_ACCOUNTS_RAW_LEN, $RENDER_ACCOUNTS_JSON_ERR;
     out($chat, "🩺 Running checks…");
 
     $lines = [];
@@ -660,14 +674,28 @@ function show_check($chat) {
                    "</code> but the token belongs to <code>" . esc($me['login']) . "</code>";
     }
 
+    // Diagnostics for RENDER_ACCOUNTS specifically — helps spot a bad
+    // paste (curly quotes, missing bracket) instead of guessing blind.
+    if ($RENDER_ACCOUNTS_RAW_LEN === -1) {
+        $lines[] = "ℹ️ <b>RENDER_ACCOUNTS</b> — not set (using RENDER_API_KEY fallback if present)";
+    } elseif ($RENDER_ACCOUNTS_JSON_ERR !== '') {
+        $lines[] = "❌ <b>RENDER_ACCOUNTS is set but invalid JSON</b> (" . esc($RENDER_ACCOUNTS_RAW_LEN) . " chars)\n" .
+                   "     <i>Error: " . esc($RENDER_ACCOUNTS_JSON_ERR) . "</i>\n" .
+                   "     <i>Common cause: curly “ ” quotes instead of straight \" \" from copy-paste, " .
+                   "or a missing closing bracket at the end.</i>";
+    } else {
+        $lines[] = "✅ <b>RENDER_ACCOUNTS</b> — valid JSON, " . esc($RENDER_ACCOUNTS_RAW_LEN) . " chars, " . count($RENDER_ACCOUNTS) . " account(s) parsed";
+    }
+
     if (!$RENDER_ACCOUNTS) {
         $lines[] = "❌ <b>Render</b> — no account connected\n     <i>Set RENDER_ACCOUNTS in Environment, then send /help.</i>";
     } else {
         foreach ($RENDER_ACCOUNTS as $i => $a) {
             [$c2, $svcs] = render_services($i);
+            $oidNote = empty($a['owner_id']) ? " ⚠️ <i>no owner_id resolved</i>" : '';
             $lines[] = ($c2 === 200)
                 ? "✅ <b>Render — " . esc($a['name']) . "</b> — connected, " . count($svcs) . " web service(s)"
-                : "❌ <b>Render — " . esc($a['name']) . "</b> — request failed (HTTP " . esc($c2) . ")\n     <i>Check its key is Full Access and still valid.</i>";
+                : "❌ <b>Render — " . esc($a['name']) . "</b> — request failed (HTTP " . esc($c2) . ")$oidNote\n     <i>Check its key is Full Access and still valid.</i>";
         }
     }
 
