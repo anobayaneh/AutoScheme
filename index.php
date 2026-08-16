@@ -149,11 +149,25 @@ if (!$RENDER_ACCOUNTS) {
     }
 }
 foreach ($RENDER_ACCOUNTS as $i => $a) {
-    if (!empty($a['owner_id'])) continue;
+    // Always ask the key which owner(s) it can actually see, then use
+    // that as ground truth — an owner_id typed in wrong (extra space, a
+    // swapped character) would otherwise cause a silently-empty site
+    // list instead of a visible error, since the API call itself still
+    // succeeds, just against the wrong workspace.
     [, $owners] = render_owners_for_key($a['key']);
-    if ($owners) {
+    if (!$owners) {
+        $RENDER_ACCOUNTS[$i]['owner_lookup_failed'] = true;
+        continue;
+    }
+    $ids = array_column($owners, 'id');
+    if (empty($a['owner_id']) || !in_array($a['owner_id'], $ids, true)) {
+        if (!empty($a['owner_id'])) $RENDER_ACCOUNTS[$i]['owner_id_mismatch'] = $a['owner_id'];   // record what was wrong, for /check
         $RENDER_ACCOUNTS[$i]['owner_id'] = $owners[0]['id'];
-        if (empty($RENDER_ACCOUNTS[$i]['email'])) $RENDER_ACCOUNTS[$i]['email'] = $owners[0]['email'] ?: $owners[0]['name'];
+    }
+    if (empty($RENDER_ACCOUNTS[$i]['email'])) {
+        foreach ($owners as $o) {
+            if ($o['id'] === $RENDER_ACCOUNTS[$i]['owner_id']) { $RENDER_ACCOUNTS[$i]['email'] = $o['email'] ?: $o['name']; break; }
+        }
     }
 }
 
@@ -781,11 +795,19 @@ function show_check($chat) {
         $lines[] = "❌ <b>Render</b> — no account connected\n     <i>Set RENDER_KEY1 (and optionally RENDER_NAME1/RENDER_OWNER1) in Environment, then send /help.</i>";
     } else {
         foreach ($RENDER_ACCOUNTS as $i => $a) {
-            [$c2, $svcs] = render_services($i);
-            $oidNote = empty($a['owner_id']) ? " ⚠️ <i>no owner_id resolved</i>" : '';
+            [$c2, $svcs, $rawTotal] = render_services($i);
+            $note = '';
+            if (!empty($a['owner_lookup_failed'])) {
+                $note = " ⚠️ <i>couldn't verify owner (key may be invalid)</i>";
+            } elseif (!empty($a['owner_id_mismatch'])) {
+                $note = " ⚠️ <i>fixed owner_id — you set <code>" . esc($a['owner_id_mismatch']) .
+                        "</code> but the key actually belongs to <code>" . esc($a['owner_id']) . "</code></i>";
+            }
+            $countNote = ($c2 === 200 && count($svcs) === 0 && $rawTotal > 0)
+                ? " <i>($rawTotal raw item(s), 0 matched a supported type)</i>" : '';
             $lines[] = ($c2 === 200)
-                ? "✅ <b>Render — " . esc($a['name']) . "</b> — connected, " . count($svcs) . " web service(s)"
-                : "❌ <b>Render — " . esc($a['name']) . "</b> — request failed (HTTP " . esc($c2) . ")$oidNote\n     <i>Check its key is Full Access and still valid.</i>";
+                ? "✅ <b>Render — " . esc($a['name']) . "</b> — connected, " . count($svcs) . " service(s)$countNote$note"
+                : "❌ <b>Render — " . esc($a['name']) . "</b> — request failed (HTTP " . esc($c2) . ")$note\n     <i>Check its key is Full Access and still valid.</i>";
         }
     }
 
