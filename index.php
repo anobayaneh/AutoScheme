@@ -50,6 +50,13 @@
 date_default_timezone_set('Asia/Manila');
 mb_internal_encoding('UTF-8');
 
+/**
+ * Bump this string whenever you deploy new code. /check prints it, so
+ * you can confirm the running process is actually your latest upload —
+ * not a stale container that never restarted.
+ */
+define('BOT_BUILD_ID', 'v6-numbered-accounts-2026-08-17');
+
 // ============================================================
 //  1. CONFIGURATION  (Render → your service → Environment)
 // ============================================================
@@ -377,10 +384,14 @@ function account_email($idx) {
     if (!$a) return '';
     if (!empty($a['email'])) return $a['email'];
     [, $owners] = render_owners_for_key($a['key']);
+    if (!$owners) return '';
+    // Prefer an exact owner_id match; if none matches (typo, or owner_id
+    // left blank), fall back to the first owner the key can see — a key
+    // almost always belongs to exactly one workspace anyway.
     foreach ($owners as $o) {
-        if (empty($a['owner_id']) || $o['id'] === $a['owner_id']) return $o['email'] ?: $o['name'];
+        if (!empty($a['owner_id']) && $o['id'] === $a['owner_id']) return $o['email'] ?: $o['name'];
     }
-    return '';
+    return $owners[0]['email'] ?: $owners[0]['name'];
 }
 
 /**
@@ -412,19 +423,38 @@ function rnd($method, $path, $body = null, $acctIdx = 0) {
     return [$c, json_decode($r, true)];
 }
 
+/** Types worth showing in "my sites" — everything deployable, not just Docker web services. */
+const RENDER_SHOWABLE_TYPES = ['web_service', 'static_site', 'private_service', 'background_worker', 'cron_job'];
+
+function type_icon($type) {
+    return [
+        'web_service'       => '🌐',
+        'static_site'       => '📄',
+        'private_service'   => '🔒',
+        'background_worker' => '⚙️',
+        'cron_job'          => '⏰',
+    ][$type] ?? '📦';
+}
+
+/**
+ * Returns [http_code, services, raw_total]. raw_total is how many items
+ * Render returned before filtering — lets /accounts explain a "0 sites"
+ * result that's actually a type mismatch (e.g. all static sites) rather
+ * than a genuinely empty account.
+ */
 function render_services($acctIdx = 0) {
     $acct = account($acctIdx);
-    if (!$acct) return [0, []];
+    if (!$acct) return [0, [], 0];
     [$c, $svcs] = rnd('GET', "/services?ownerId={$acct['owner_id']}&limit=100", null, $acctIdx);
-    if ($c !== 200 || !is_array($svcs)) return [$c, []];
+    if ($c !== 200 || !is_array($svcs)) return [$c, [], 0];
     $list = [];
     foreach ($svcs as $item) {
         $svc = $item['service'] ?? $item;
-        if (($svc['type'] ?? '') !== 'web_service') continue;
+        if (!in_array($svc['type'] ?? '', RENDER_SHOWABLE_TYPES, true)) continue;
         $svc['_acct'] = $acctIdx;
         $list[] = $svc;
     }
-    return [200, $list];
+    return [200, $list, count($svcs)];
 }
 
 /** Services across every configured account, each tagged with its account index. */
@@ -706,6 +736,7 @@ function show_check($chat) {
     out($chat, "🩺 Running checks…");
 
     $lines = [];
+    $lines[] = "🏗 <b>Running code:</b> <code>" . esc(BOT_BUILD_ID) . "</code>";
 
     [$c1, $me] = gh('GET', '/user');
     $lines[] = ($c1 === 200)
@@ -716,6 +747,20 @@ function show_check($chat) {
         $lines[] = "⚠️ <b>Owner mismatch</b> — GITHUB_OWNER is <code>" . esc($GITHUB_OWNER) .
                    "</code> but the token belongs to <code>" . esc($me['login']) . "</code>";
     }
+
+    // Raw dump of exactly what getenv() sees for the relevant keys right
+    // now, in THIS process — the fastest way to prove whether a dashboard
+    // change has actually reached the running server or not.
+    $envDump = [];
+    foreach (['RENDER_KEY1', 'RENDER_KEY2', 'RENDER_KEY3', 'RENDER_OWNER1', 'RENDER_OWNER2',
+              'RENDER_NAME1', 'RENDER_NAME2', 'RENDER_ACCOUNTS', 'RENDER_API_KEY', 'RENDER_OWNER_ID'] as $k) {
+        $v = getenv($k);
+        if ($v === false) { $envDump[] = "     <code>$k</code> → <i>not present</i>"; continue; }
+        if ($v === '')    { $envDump[] = "     <code>$k</code> → <i>present but empty</i>"; continue; }
+        $shown = (strlen($v) > 12) ? substr($v, 0, 4) . '…' . substr($v, -4) . ' (' . strlen($v) . ' chars)' : esc($v);
+        $envDump[] = "     <code>$k</code> → <code>" . esc($shown) . "</code>";
+    }
+    $lines[] = "🔬 <b>Raw environment seen by this process:</b>\n" . implode("\n", $envDump);
 
     // Diagnostics — which source actually supplied the accounts, so a
     // silent mismatch (env var not really reaching PHP) is visible.
@@ -771,7 +816,7 @@ function show_accounts($chat) {
     $lines = [];
     $totalSites = 0;
     foreach ($RENDER_ACCOUNTS as $i => $a) {
-        [$c, $svcs] = render_services($i);
+        [$c, $svcs, $rawTotal] = render_services($i);
         $email = account_email($i);
         if ($c !== 200) {
             $lines[] = "🔀 <b>" . esc($a['name']) . "</b>\n     ❌ connection error (HTTP " . esc($c) . ")";
@@ -779,9 +824,15 @@ function show_accounts($chat) {
         }
         $count = count($svcs);
         $totalSites += $count;
+        $note = '';
+        if ($count === 0 && $rawTotal > 0) {
+            $note = "\n     <i>ℹ️ Render actually has $rawTotal item(s) here, but none match a " .
+                    "supported type (web/static/private service, worker, cron job) — check they're " .
+                    "not, say, a database.</i>";
+        }
         $lines[] = "🔀 <b>" . esc($a['name']) . "</b>\n" .
                    "     📧 " . esc($email ?: '—') . "\n" .
-                   "     🗂 <code>$count</code> site(s)";
+                   "     🗂 <code>$count</code> site(s)" . $note;
     }
 
     $best = pick_best_account();
@@ -1445,9 +1496,10 @@ function list_services($chat, $page = 0, $acctSel = 0) {
 
     $rows = [];
     foreach (array_slice($svcs, $page * $PAGE_SIZE, $PAGE_SIZE) as $svc) {
-        $icon = (($svc['suspended'] ?? '') === 'suspended') ? '⏸' : '🟢';
+        $status = (($svc['suspended'] ?? '') === 'suspended') ? '⏸' : '🟢';
+        $tIcon = type_icon($svc['type'] ?? '');
         $acctIdx = $svc['_acct'] ?? (is_numeric($acctSel) ? (int)$acctSel : 0);
-        $label = "$icon " . $svc['name'];
+        $label = "$status $tIcon " . $svc['name'];
         if ($acctSel === 'all' && count($RENDER_ACCOUNTS) > 1) $label .= "  ·  " . account_name($acctIdx);
         $rows[] = [['text' => $label, 'callback_data' => "svc:$acctIdx:" . $svc['id']]];
     }
@@ -1461,7 +1513,8 @@ function list_services($chat, $page = 0, $acctSel = 0) {
 
     $where = ($acctSel === 'all') ? 'all accounts' : account_name($acctSel);
     out($chat, "🗂 <b>My sites</b>  <i>($total · " . esc($where) . ")</i>\n" . rule() . "\n" .
-               "🟢 running   ⏸ stopped\n\n<i>Tap a site to redeploy, restart, stop or delete it.</i>", $rows);
+               "🟢 running · ⏸ stopped   —   🌐 web · 📄 static · 🔒 private · ⚙️ worker · ⏰ cron\n\n" .
+               "<i>Tap a site to redeploy, restart, stop or delete it.</i>", $rows);
 }
 
 /** Repos this bot created, identified by the description it writes. */
