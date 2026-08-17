@@ -55,7 +55,7 @@ mb_internal_encoding('UTF-8');
  * you can confirm the running process is actually your latest upload —
  * not a stale container that never restarted.
  */
-define('BOT_BUILD_ID', 'v6-numbered-accounts-2026-08-17');
+define('BOT_BUILD_ID', 'v7-multi-github-dest-2026-08-17');
 
 // ============================================================
 //  1. CONFIGURATION  (Render → your service → Environment)
@@ -64,6 +64,59 @@ $TELEGRAM_TOKEN  = getenv('TELEGRAM_TOKEN');
 $ADMIN_CHAT_ID   = getenv('ADMIN_CHAT_ID');
 $GITHUB_TOKEN    = getenv('GITHUB_TOKEN');
 $GITHUB_OWNER    = getenv('GITHUB_OWNER');
+
+/**
+ * Destination GitHub accounts — where COPIES land. GITHUB_TOKEN/OWNER
+ * above is always where you BROWSE TEMPLATES from and stays index 0
+ * here too ("Main"), so if you never configure anything else, copies
+ * land right alongside the templates exactly like before.
+ *
+ * Add more destination accounts the same way as Render accounts —
+ * numbered environment variables:
+ *
+ *   GITHUB_DEST_NAME1=Client Repos
+ *   GITHUB_DEST_TOKEN1=ghp_xxxxxxxxxxxx
+ *   GITHUB_DEST_OWNER1=that-account-username
+ *
+ *   GITHUB_DEST_NAME2=Another Copies Account
+ *   GITHUB_DEST_TOKEN2=ghp_yyyyyyyyyyyy
+ *   GITHUB_DEST_OWNER2=another-username
+ *
+ * Only GITHUB_DEST_TOKEN<n> is required — a Personal Access Token
+ * (classic, repo scope) generated FROM that account. GITHUB_DEST_NAME<n>
+ * defaults to "Copies Account n". GITHUB_DEST_OWNER<n> is looked up
+ * automatically from the token if you leave it out, but setting it
+ * yourself is more reliable.
+ *
+ * When more than one destination exists, /newhost asks which one to
+ * use for each deployment. With only "Main", nothing changes — no
+ * extra question, same as the original single-account behaviour.
+ */
+$GITHUB_DEST_ACCOUNTS = [
+    ['name' => 'Main (same as templates)', 'token' => $GITHUB_TOKEN, 'owner' => $GITHUB_OWNER],
+];
+for ($i = 1; $i <= 10; $i++) {
+    $tok = getenv("GITHUB_DEST_TOKEN$i");
+    if ($tok === false || $tok === '') continue;
+    $own = getenv("GITHUB_DEST_OWNER$i") ?: '';
+    $nam = getenv("GITHUB_DEST_NAME$i") ?: "Copies Account $i";
+    $GITHUB_DEST_ACCOUNTS[] = ['name' => $nam, 'token' => $tok, 'owner' => $own];
+}
+// Backwards compatible with the earlier single-destination env vars.
+$oldDestTok = getenv('GITHUB_DEST_TOKEN');
+if ($oldDestTok) {
+    $GITHUB_DEST_ACCOUNTS[] = [
+        'name'  => getenv('GITHUB_DEST_NAME') ?: 'Copies Account',
+        'token' => $oldDestTok, 'owner' => getenv('GITHUB_DEST_OWNER') ?: '',
+    ];
+}
+$GITHUB_DEST_IS_SEPARATE = count($GITHUB_DEST_ACCOUNTS) > 1;
+foreach ($GITHUB_DEST_ACCOUNTS as $i => $a) {
+    if ($i === 0 || !empty($a['owner'])) continue;   // index 0 always has owner already
+    [$c, $me] = gh('GET', '/user', null, $i);
+    if ($c === 200 && !empty($me['login'])) $GITHUB_DEST_ACCOUNTS[$i]['owner'] = $me['login'];
+}
+
 $RENDER_REGION   = getenv('RENDER_REGION') ?: 'singapore';
 $CONFIG_PATH     = getenv('CONFIG_PATH') ?: 'config.php';
 $STATE_FILE      = getenv('STATE_FILE') ?: '/tmp/bot_state.json';
@@ -71,6 +124,9 @@ $DEFAULT_PRIVATE = getenv('CLONE_PRIVATE') === null ? true : (getenv('CLONE_PRIV
 
 $PAGE_SIZE      = 8;     // buttons per page
 $MAX_COPY_FILES = 300;   // ceiling for the fallback copy method
+
+/** Files verified (and repaired from the source repo if missing) after every clone. */
+$CRITICAL_FILES = array_filter(array_map('trim', explode(',', getenv('CRITICAL_FILES') ?: 'Dockerfile')));
 
 /**
  * Render accounts this bot can deploy to / manage.
@@ -356,13 +412,31 @@ function ensure_bot_commands() {
 // ============================================================
 //  4. GITHUB & RENDER CLIENTS
 // ============================================================
-function gh($method, $path, $body = null) {
-    global $GITHUB_TOKEN;
-    $h = ["Authorization: Bearer $GITHUB_TOKEN", "User-Agent: render-deploy-bot",
+/** $useDest = true routes through the destination-account token, for anything touching a cloned repo. */
+/** $destIdx: null = source/template account. Int = index into $GITHUB_DEST_ACCOUNTS. `true` is kept as a legacy alias for index 0. */
+function gh($method, $path, $body = null, $destIdx = null) {
+    global $GITHUB_TOKEN, $GITHUB_DEST_ACCOUNTS;
+    if ($destIdx === null || $destIdx === false) {
+        $token = $GITHUB_TOKEN;
+    } else {
+        if ($destIdx === true) $destIdx = 0;
+        $acct = $GITHUB_DEST_ACCOUNTS[(int)$destIdx] ?? ($GITHUB_DEST_ACCOUNTS[0] ?? null);
+        $token = $acct ? $acct['token'] : $GITHUB_TOKEN;
+    }
+    $h = ["Authorization: Bearer $token", "User-Agent: render-deploy-bot",
           "Accept: application/vnd.github+json", "X-GitHub-Api-Version: 2022-11-28"];
     if ($body !== null) $h[] = "Content-Type: application/json";
     [$c, $r] = http($method, "https://api.github.com$path", $h, $body !== null ? json_encode($body) : null);
     return [$c, json_decode($r, true)];
+}
+
+function github_dest_name($idx) {
+    global $GITHUB_DEST_ACCOUNTS;
+    return $GITHUB_DEST_ACCOUNTS[$idx]['name'] ?? 'Unknown account';
+}
+function github_dest_owner($idx) {
+    global $GITHUB_DEST_ACCOUNTS;
+    return $GITHUB_DEST_ACCOUNTS[$idx]['owner'] ?? '';
 }
 
 /** account() resolves an index (or 'auto' → first) to its credentials. */
@@ -539,8 +613,8 @@ function sanitize_service_name($raw) {
     $n = strtolower(preg_replace('/[^A-Za-z0-9-]+/', '-', trim((string)$raw)));
     return trim(preg_replace('/-{2,}/', '-', $n), '-');
 }
-function repo_exists($owner, $name) {
-    [$c] = gh('GET', "/repos/$owner/$name");
+function repo_exists($owner, $name, $destIdx = null) {
+    [$c] = gh('GET', "/repos/$owner/$name", null, $destIdx);
     return $c === 200;
 }
 /** If "avea-zae" is taken on the target account, try "avea-zae-2", "-3", and so on. */
@@ -556,7 +630,7 @@ function free_service_name($base, $acctIdx) {
 // ============================================================
 //  7. REPOSITORY CLONING
 // ============================================================
-/** Flag the source repo as a GitHub template if it isn't one already. */
+/** Flag the source repo as a GitHub template if it isn't one already — always via the SOURCE token, since it edits the template repo itself. */
 function ensure_template($repo) {
     [$c, $r] = gh('GET', "/repos/$repo");
     if ($c !== 200) return [false, "could not read the repo (HTTP $c)"];
@@ -566,23 +640,33 @@ function ensure_template($repo) {
     return [true, null];
 }
 
-/** Preferred path: GitHub's "generate from template" endpoint. */
-function clone_via_template($srcRepo, $owner, $newName, $private, $desc) {
+/**
+ * Preferred path: GitHub's "generate from template" endpoint. Creates
+ * the copy through the DESTINATION account's token — that account needs
+ * read access to the template repo for this to work (public template,
+ * or the dest account added as a collaborator/org member on it). Falls
+ * back to clone_via_copy automatically when this isn't possible.
+ */
+function clone_via_template($srcRepo, $owner, $newName, $private, $desc, $destIdx) {
     [$ok, $err] = ensure_template($srcRepo);
     if (!$ok) return [0, null, $err];
     [$c, $r] = gh('POST', "/repos/$srcRepo/generate", [
         'owner' => $owner, 'name' => $newName, 'private' => (bool)$private,
         'description' => $desc, 'include_all_branches' => false,
-    ]);
+    ], $destIdx);
     if ($c < 200 || $c >= 300) return [$c, null, substr(json_encode($r), 0, 250)];
     return [$c, $r, null];
 }
 
 /**
  * Fallback: create an empty repo and copy the whole tree file by file.
- * Slower and capped, but works when the template route is unavailable.
+ * Slower and capped, but works when the template route is unavailable —
+ * and is the RELIABLE path for cross-account copies, since it only
+ * needs read access to the source (via the source token) and write
+ * access to the destination (via the destination token) separately,
+ * rather than one token needing both at once.
  */
-function clone_via_copy($srcRepo, $owner, $newName, $private, $branch, $desc) {
+function clone_via_copy($srcRepo, $owner, $newName, $private, $branch, $desc, $destIdx) {
     global $MAX_COPY_FILES;
 
     [$ct, $tree] = gh('GET', "/repos/$srcRepo/git/trees/" . rawurlencode($branch) . "?recursive=1");
@@ -599,7 +683,7 @@ function clone_via_copy($srcRepo, $owner, $newName, $private, $branch, $desc) {
     [$cr, $repo] = gh('POST', '/user/repos', [
         'name' => $newName, 'private' => (bool)$private,
         'description' => $desc, 'auto_init' => false,
-    ]);
+    ], $destIdx);
     if ($cr < 200 || $cr >= 300) return [$cr, null, substr(json_encode($repo), 0, 250)];
 
     $newFull = "$owner/$newName";
@@ -609,33 +693,60 @@ function clone_via_copy($srcRepo, $owner, $newName, $private, $branch, $desc) {
         if ($cb !== 200 || !isset($blob['content'])) continue;
         [$cn, $nb] = gh('POST', "/repos/$newFull/git/blobs", [
             'content' => str_replace("\n", '', $blob['content']), 'encoding' => 'base64',
-        ]);
+        ], $destIdx);
         if ($cn < 200 || $cn >= 300) continue;
         $entries[] = ['path' => $e['path'], 'mode' => $e['mode'], 'type' => 'blob', 'sha' => $nb['sha']];
     }
     if (!$entries) return [0, null, "no files could be copied"];
 
-    [$c1, $nt] = gh('POST', "/repos/$newFull/git/trees", ['tree' => $entries]);
+    [$c1, $nt] = gh('POST', "/repos/$newFull/git/trees", ['tree' => $entries], $destIdx);
     if ($c1 < 200 || $c1 >= 300) return [$c1, null, "could not build the file tree"];
     [$c2, $nc] = gh('POST', "/repos/$newFull/git/commits", [
         'message' => "init: copied from $srcRepo", 'tree' => $nt['sha'], 'parents' => [],
-    ]);
+    ], $destIdx);
     if ($c2 < 200 || $c2 >= 300) return [$c2, null, "could not create the first commit"];
-    [$c3] = gh('POST', "/repos/$newFull/git/refs", ['ref' => 'refs/heads/main', 'sha' => $nc['sha']]);
+    [$c3] = gh('POST', "/repos/$newFull/git/refs", ['ref' => 'refs/heads/main', 'sha' => $nc['sha']], $destIdx);
     if ($c3 < 200 || $c3 >= 300) return [$c3, null, "could not create the main branch"];
 
     return [201, ['full_name' => $newFull, 'default_branch' => 'main',
                   'html_url' => "https://github.com/$newFull"], null];
 }
 
-/** New repos are populated asynchronously, so poll until the config file appears. */
-function wait_for_file($repo, $branch, $path, $tries = 6) {
+/** New repos are populated asynchronously, so poll until the config file appears. Always the destination repo, so the dest token. */
+function wait_for_file($repo, $branch, $path, $destIdx, $tries = 6) {
     for ($i = 0; $i < $tries; $i++) {
-        [$c, $f] = gh('GET', "/repos/$repo/contents/" . rawurlencode($path) . "?ref=$branch");
+        [$c, $f] = gh('GET', "/repos/$repo/contents/" . rawurlencode($path) . "?ref=$branch", null, $destIdx);
         if ($c === 200 && !empty($f['content'])) return $f;
         sleep(2);
     }
     return null;
+}
+
+/**
+ * Some files (Dockerfile especially) occasionally don't make it through
+ * GitHub's template-generate step. After cloning, verify each file in
+ * $CRITICAL_FILES exists in the new repo; if not, fetch it straight
+ * from the source repo and write it in — a small, targeted repair
+ * rather than distrusting the whole clone.
+ */
+function repair_missing_files($srcRepo, $srcBranch, $newFull, $newBranch, $destIdx) {
+    global $CRITICAL_FILES;
+    $repaired = []; $stillMissing = [];
+    foreach ($CRITICAL_FILES as $path) {
+        [$c] = gh('GET', "/repos/$newFull/contents/" . rawurlencode($path) . "?ref=$newBranch", null, $destIdx);
+        if ($c === 200) continue;   // already there, nothing to do
+
+        [$cs, $srcFile] = gh('GET', "/repos/$srcRepo/contents/" . rawurlencode($path) . "?ref=$srcBranch");
+        if ($cs !== 200 || empty($srcFile['content'])) { $stillMissing[] = $path; continue; }
+
+        [$cp, ] = gh('PUT', "/repos/$newFull/contents/" . rawurlencode($path), [
+            'message' => "chore: restore $path from template",
+            'content' => $srcFile['content'],
+            'branch'  => $newBranch,
+        ], $destIdx);
+        if ($cp >= 200 && $cp < 300) $repaired[] = $path; else $stillMissing[] = $path;
+    }
+    return [$repaired, $stillMissing];
 }
 
 // ============================================================
@@ -660,7 +771,7 @@ function replace_var($content, $var, $value) {
 //  9. MENU, HELP, DIAGNOSTICS
 // ============================================================
 function show_menu($chat) {
-    global $RENDER_ACCOUNTS;
+    global $RENDER_ACCOUNTS, $GITHUB_DEST_ACCOUNTS;
 
     if (!$RENDER_ACCOUNTS) {
         out($chat,
@@ -668,15 +779,17 @@ function show_menu($chat) {
             "I copy one of your GitHub repos, drop in a fresh <code>config.php</code>, " .
             "and put the copy live on Render.\n\n" .
             "⚠️ <b>No Render account connected yet.</b>\n" .
-            "Set <code>RENDER_ACCOUNTS</code> in this bot's Environment tab on Render, then " .
+            "Add <code>RENDER_KEY1</code> in this bot's Environment tab on Render, then " .
             "send /help for the exact format.",
             [[['text' => '❓ Help', 'callback_data' => 'nav:help']]]);
         return;
     }
 
-    $acctLine = count($RENDER_ACCOUNTS) > 1
-        ? "🔀 <b>" . count($RENDER_ACCOUNTS) . " Render accounts</b> connected — pick one anytime, or view all together.\n\n"
-        : '';
+    $bits = [];
+    if (count($RENDER_ACCOUNTS) > 1)      $bits[] = "🔀 " . count($RENDER_ACCOUNTS) . " Render accounts";
+    if (count($GITHUB_DEST_ACCOUNTS) > 1) $bits[] = "🐙 " . count($GITHUB_DEST_ACCOUNTS) . " GitHub destinations";
+    $acctLine = $bits ? implode(" · ", $bits) . " connected — pick anytime during a deploy.\n\n" : '';
+
     out($chat,
         "🏠 <b>Deploy Bot</b>\n" . rule() . "\n" .
         "I copy one of your GitHub repos, drop in a fresh <code>config.php</code>, " .
@@ -736,6 +849,32 @@ function show_help($chat) {
         "🩺 <code>/check</code> — test the GitHub and Render connections\n" .
         "🛑 <code>/cancel</code> — abort the wizard\n" .
         "🏠 <code>/menu</code> — back to the main menu\n\n" .
+        "<b>Multiple GitHub destination accounts</b>\n" .
+        "By default templates and copies live in the same GitHub account " .
+        "(<code>GITHUB_TOKEN</code> / <code>GITHUB_OWNER</code> — shown as \"Main\"). To send copies " .
+        "to one or more other accounts instead, add numbered variables, same pattern as Render " .
+        "accounts:\n\n" .
+        "<pre>GITHUB_DEST_NAME1=Client Repos\nGITHUB_DEST_TOKEN1=ghp_xxxxxxxxxxxx\nGITHUB_DEST_OWNER1=that-account-username</pre>\n" .
+        "For a 2nd destination, <code>GITHUB_DEST_NAME2</code> / <code>GITHUB_DEST_TOKEN2</code> / " .
+        "<code>GITHUB_DEST_OWNER2</code>, and so on.\n\n" .
+        "Only <code>GITHUB_DEST_TOKEN&lt;n&gt;</code> is required — a Personal Access Token (classic, " .
+        "repo scope) generated <b>from that account</b> — Settings → Developer settings → Personal " .
+        "access tokens, while logged into it. <code>GITHUB_DEST_OWNER&lt;n&gt;</code> is looked up " .
+        "automatically if left out. You'll still <u>browse templates</u> from your main account as " .
+        "usual — only the copies (and their config.php) land in whichever destination you pick.\n\n" .
+        "With 2+ destinations configured, <code>/newhost</code> asks which one to use for each " .
+        "deployment — same pattern as picking a Render account.\n\n" .
+        "⚠️ If your template repos are <b>private</b>, a destination account needs read access to " .
+        "them (add it as a collaborator, or keep the templates public) — otherwise the fast copy " .
+        "path fails and the bot automatically falls back to a slower file-by-file copy, which still " .
+        "works either way.\n\n" .
+        "Also connect Render's GitHub App to <b>All repositories</b> on every destination account — " .
+        "that's the account Render actually pulls from when building.\n\n" .
+        "<b>Missing files after cloning (e.g. Dockerfile)</b>\n" .
+        "GitHub's template-copy occasionally drops a file or two. Every deployment now checks for " .
+        "<code>Dockerfile</code> right after cloning and restores it straight from the template if " .
+        "it's missing. Add more filenames to watch via <code>CRITICAL_FILES</code> (comma-separated), " .
+        "e.g. <code>CRITICAL_FILES=Dockerfile,render.yaml</code>.\n\n" .
         "<b>One-time setup to check</b>\n" .
         "On GitHub go to <i>Settings → Applications → Render</i> and give it access to " .
         "<b>All repositories</b>. Do this for <u>every</u> Render account you connect — otherwise " .
@@ -745,7 +884,7 @@ function show_help($chat) {
 
 /** Quick health check so a failure later is easier to diagnose. */
 function show_check($chat) {
-    global $GITHUB_OWNER, $RENDER_ACCOUNTS, $RENDER_REGION, $CONFIG_PATH, $ADMIN_CHAT_ID;
+    global $GITHUB_OWNER, $GITHUB_DEST_ACCOUNTS, $RENDER_ACCOUNTS, $RENDER_REGION, $CONFIG_PATH, $ADMIN_CHAT_ID;
     global $RENDER_ACCOUNTS_RAW_LEN, $RENDER_ACCOUNTS_JSON_ERR, $RENDER_ACCOUNTS_SOURCE;
     out($chat, "🩺 Running checks…");
 
@@ -754,12 +893,26 @@ function show_check($chat) {
 
     [$c1, $me] = gh('GET', '/user');
     $lines[] = ($c1 === 200)
-        ? "✅ <b>GitHub</b> — signed in as <code>" . esc($me['login']) . "</code>"
-        : "❌ <b>GitHub</b> — token rejected (HTTP " . esc($c1) . ")\n     <i>Check GITHUB_TOKEN has the “repo” scope.</i>";
+        ? "✅ <b>GitHub (templates)</b> — signed in as <code>" . esc($me['login']) . "</code>"
+        : "❌ <b>GitHub (templates)</b> — token rejected (HTTP " . esc($c1) . ")\n     <i>Check GITHUB_TOKEN has the “repo” scope.</i>";
 
     if ($c1 === 200 && strcasecmp($me['login'], (string)$GITHUB_OWNER) !== 0) {
         $lines[] = "⚠️ <b>Owner mismatch</b> — GITHUB_OWNER is <code>" . esc($GITHUB_OWNER) .
                    "</code> but the token belongs to <code>" . esc($me['login']) . "</code>";
+    }
+
+    // GITHUB_DEST_ACCOUNTS[0] is always "Main" (same as templates) —
+    // only test the ones beyond that, since index 0 duplicates the check above.
+    foreach ($GITHUB_DEST_ACCOUNTS as $idx => $acct) {
+        if ($idx === 0) continue;
+        [$cd, $med] = gh('GET', '/user', null, $idx);
+        $lines[] = ($cd === 200)
+            ? "✅ <b>GitHub — " . esc($acct['name']) . "</b> — signed in as <code>" . esc($med['login']) . "</code>"
+            : "❌ <b>GitHub — " . esc($acct['name']) . "</b> — token rejected (HTTP " . esc($cd) . ")\n     <i>Check its token has the “repo” scope.</i>";
+        if ($cd === 200 && !empty($acct['owner']) && strcasecmp($med['login'], $acct['owner']) !== 0) {
+            $lines[] = "⚠️ <b>Owner mismatch on " . esc($acct['name']) . "</b> — set as <code>" . esc($acct['owner']) .
+                       "</code> but that token belongs to <code>" . esc($med['login']) . "</code>";
+        }
     }
 
     // Raw dump of exactly what getenv() sees for the relevant keys right
@@ -955,7 +1108,7 @@ function list_repos($chat, $page = 0, $filter = '') {
     $rows[] = [['text' => '🔍 Search', 'callback_data' => 'reposearch'],
                ['text' => '❌ Cancel', 'callback_data' => 'cancel']];
 
-    $head  = "🚀 <b>New deployment</b>   <i>step 1 of " . wizard_total_steps() . "</i>\n" . bar(1, wizard_total_steps()) . "\n" . rule() . "\n";
+    $head  = "🚀 <b>New deployment</b>   <i>step " . wizard_step_num('repo') . " of " . wizard_total_steps() . "</i>\n" . bar(wizard_step_num('repo'), wizard_total_steps()) . "\n" . rule() . "\n";
     $head .= "🧩 <b>Which repo should I copy?</b>\n\n";
     $head .= "This one stays exactly as it is — I only make a copy of it.\n\n";
     $head .= "<i>🧩 already a template · 🔒 private · 📂 public</i>";
@@ -964,10 +1117,25 @@ function list_repos($chat, $page = 0, $filter = '') {
     out($chat, $head, $rows);
 }
 
-/** Wizard has one extra step when there's more than one Render account to pick from. */
-function wizard_total_steps() {
-    global $RENDER_ACCOUNTS;
-    return count($RENDER_ACCOUNTS) > 1 ? 5 : 4;
+/**
+ * The wizard's step count and numbering flex depending on how many
+ * optional choices actually exist — no picker shown, no step wasted on
+ * it. wizard_step_num('ghdest') etc gives the step number to print for
+ * that phase; wizard_total_steps() the total for the progress bar.
+ */
+function wizard_phases() {
+    global $RENDER_ACCOUNTS, $GITHUB_DEST_ACCOUNTS;
+    $p = ['repo', 'name'];
+    if (count($GITHUB_DEST_ACCOUNTS) > 1) $p[] = 'ghdest';
+    if (count($RENDER_ACCOUNTS) > 1) $p[] = 'render';
+    $p[] = 'config';
+    $p[] = 'review';
+    return $p;
+}
+function wizard_total_steps() { return count(wizard_phases()); }
+function wizard_step_num($phase) {
+    $i = array_search($phase, wizard_phases(), true);
+    return $i === false ? 1 : $i + 1;
 }
 
 // ============================================================
@@ -981,7 +1149,7 @@ function ask_repo_name($chat) {
     $priv = $s[$chat]['private'] ?? $DEFAULT_PRIVATE;
 
     out($chat,
-        "🚀 <b>New deployment</b>   <i>step 2 of " . wizard_total_steps() . "</i>\n" . bar(2, wizard_total_steps()) . "\n" . rule() . "\n" .
+        "🚀 <b>New deployment</b>   <i>step " . wizard_step_num('name') . " of " . wizard_total_steps() . "</i>\n" . bar(wizard_step_num('name'), wizard_total_steps()) . "\n" . rule() . "\n" .
         "🧩 Template: <code>" . esc($src) . "</code>\n" .
         "🌿 Branch: <code>" . esc($s[$chat]['src_branch']) . "</code>\n" .
         rule() . "\n" .
@@ -1001,7 +1169,7 @@ function ask_repo_name($chat) {
 }
 
 function set_repo_name($chat, $raw) {
-    global $GITHUB_OWNER, $DEFAULT_PRIVATE;
+    global $GITHUB_DEST_ACCOUNTS, $DEFAULT_PRIVATE;
     $s    = load_state();
     $src  = $s[$chat]['src_repo'];
     $base = explode('/', $src)[1] ?? $src;
@@ -1021,31 +1189,68 @@ function set_repo_name($chat, $raw) {
         say($chat, "✏️ Adjusted to <code>" . esc($name) . "</code>\n" .
                    "<i>“" . esc($wanted) . "” contained characters GitHub doesn't accept.</i>");
     }
-    if (repo_exists($GITHUB_OWNER, $name)) {
+    // Checked against the default (Main) destination for now — if a
+    // different destination account is picked next, its own creation
+    // step will still catch a genuine name clash there.
+    $mainOwner = $GITHUB_DEST_ACCOUNTS[0]['owner'] ?? '';
+    if (repo_exists($mainOwner, $name, 0)) {
         out($chat, "⚠️ <b>That name is taken</b>\n\n" .
-                   "<code>" . esc($GITHUB_OWNER) . "/" . esc($name) . "</code> already exists.\n\n" .
+                   "<code>" . esc($mainOwner) . "/" . esc($name) . "</code> already exists.\n\n" .
                    "<i>Type a different one — try adding a number or the client's surname.</i>",
             [[['text' => '❌ Cancel', 'callback_data' => 'cancel']]]);
         return;
     }
 
     $s = load_state();
-    $s[$chat]['new_name']  = $name;
-    $s[$chat]['private']   = $s[$chat]['private'] ?? $DEFAULT_PRIVATE;
-    $s[$chat]['acct_sel']  = $s[$chat]['acct_sel'] ?? 'auto';
-    $s[$chat]['step']      = 'collect';
-    $s[$chat]['field_idx'] = 0;
-    $s[$chat]['values']    = [];
+    $s[$chat]['new_name']    = $name;
+    $s[$chat]['private']     = $s[$chat]['private'] ?? $DEFAULT_PRIVATE;
+    $s[$chat]['gh_dest_idx'] = $s[$chat]['gh_dest_idx'] ?? 0;
+    $s[$chat]['acct_sel']    = $s[$chat]['acct_sel'] ?? 'auto';
+    $s[$chat]['step']        = 'collect';
+    $s[$chat]['field_idx']   = 0;
+    $s[$chat]['values']      = [];
     save_state($s);
 
-    say($chat, "✅ <b>Name reserved</b>\n📦 <code>" . esc($GITHUB_OWNER) . "/" . esc($name) . "</code>\n\n" .
+    say($chat, "✅ <b>Name reserved</b>\n📦 <code>" . esc($name) . "</code>\n\n" .
                "<i>Nothing has been created yet — that happens at the end.</i>");
 
-    ask_deploy_account($chat);
+    ask_github_dest($chat);
 }
 
 // ============================================================
-//  12b. STEP 2.5 — WHICH RENDER ACCOUNT TO DEPLOY TO
+//  12b. STEP 2.5 — WHICH GITHUB ACCOUNT SHOULD THE COPY LAND IN
+// ============================================================
+function ask_github_dest($chat) {
+    global $GITHUB_DEST_ACCOUNTS;
+
+    if (count($GITHUB_DEST_ACCOUNTS) <= 1) {
+        ask_deploy_account($chat);   // nothing to pick — straight to the next optional step
+        return;
+    }
+
+    $s   = load_state();
+    $sel = $s[$chat]['gh_dest_idx'] ?? 0;
+
+    $rows = [];
+    foreach ($GITHUB_DEST_ACCOUNTS as $i => $a) {
+        $ownerTxt = $a['owner'] ? " ({$a['owner']})" : '';
+        $rows[] = [['text' => ($sel === $i ? '✅ ' : '') . $a['name'] . $ownerTxt, 'callback_data' => "setghdest:$i"]];
+    }
+    $rows[] = [['text' => '➡️ Continue', 'callback_data' => 'ghdestdone']];
+    $rows[] = [['text' => '❌ Cancel', 'callback_data' => 'cancel']];
+
+    out($chat,
+        "🚀 <b>New deployment</b>   <i>step " . wizard_step_num('ghdest') . " of " . wizard_total_steps() . "</i>\n" .
+        bar(wizard_step_num('ghdest'), wizard_total_steps()) . "\n" . rule() . "\n" .
+        "🐙 <b>Which GitHub account should the copy land in?</b>\n\n" .
+        "Currently selected: <b>" . esc(github_dest_name($sel)) . "</b>\n" .
+        "📦 <code>" . esc(github_dest_owner($sel)) . "/" . esc($s[$chat]['new_name']) . "</code>\n\n" .
+        "<i>This is only where the new repo is created — the template itself is never touched.</i>",
+        $rows);
+}
+
+// ============================================================
+//  12c. STEP 2.6 — WHICH RENDER ACCOUNT TO DEPLOY TO
 // ============================================================
 function ask_deploy_account($chat) {
     global $RENDER_ACCOUNTS;
@@ -1069,7 +1274,8 @@ function ask_deploy_account($chat) {
     $rows[] = [['text' => '❌ Cancel', 'callback_data' => 'cancel']];
 
     out($chat,
-        "🚀 <b>New deployment</b>   <i>step 3 of " . wizard_total_steps() . "</i>\n" . bar(3, wizard_total_steps()) . "\n" . rule() . "\n" .
+        "🚀 <b>New deployment</b>   <i>step " . wizard_step_num('render') . " of " . wizard_total_steps() . "</i>\n" .
+        bar(wizard_step_num('render'), wizard_total_steps()) . "\n" . rule() . "\n" .
         "🔀 <b>Which Render account should host this site?</b>\n\n" .
         "Currently selected: <b>" . esc($label) . "</b>\n\n" .
         "<i>🎲 Auto rotates across your connected accounts, and moves to the next one right away " .
@@ -1078,9 +1284,9 @@ function ask_deploy_account($chat) {
 }
 
 // ============================================================
-//  13. STEP 3/4 — COLLECT CONFIG VALUES
+//  13. STEP — COLLECT CONFIG VALUES
 // ============================================================
-function collect_step_num() { return wizard_total_steps() === 5 ? 4 : 3; }
+function collect_step_num() { return wizard_step_num('config'); }
 
 function ask_next_field($chat) {
     global $CONFIG_FIELDS;
@@ -1172,7 +1378,7 @@ function skip_field($chat) {
 //  14. FINAL STEP — REVIEW BEFORE ANYTHING IS CREATED
 // ============================================================
 function review($chat) {
-    global $CONFIG_FIELDS, $CONFIG_PATH, $RENDER_REGION, $GITHUB_OWNER, $RENDER_ACCOUNTS;
+    global $CONFIG_FIELDS, $CONFIG_PATH, $RENDER_REGION, $GITHUB_DEST_ACCOUNTS, $RENDER_ACCOUNTS;
     $s = load_state();
     $s[$chat]['step'] = 'review';
     save_state($s);
@@ -1192,6 +1398,8 @@ function review($chat) {
     $acctLabel = ($acctSel === 'auto')
         ? '🎲 Auto (' . implode(' → ', array_column($RENDER_ACCOUNTS, 'name')) . ')'
         : '🔀 ' . account_name($acctSel);
+    $ghDestIdx = $s[$chat]['gh_dest_idx'] ?? 0;
+    $ghOwner   = github_dest_owner($ghDestIdx);
 
     $total = wizard_total_steps();
     out($chat,
@@ -1199,7 +1407,8 @@ function review($chat) {
         "📋 <b>Ready — please review</b>\n\n" .
         "🧩 Copy from: <code>" . esc($s[$chat]['src_repo']) . "</code>\n" .
         "         ↓\n" .
-        "📦 New repo: <code>" . esc($GITHUB_OWNER) . "/" . esc($s[$chat]['new_name']) . "</code>\n" .
+        "📦 New repo: <code>" . esc($ghOwner) . "/" . esc($s[$chat]['new_name']) . "</code>\n" .
+        (count($GITHUB_DEST_ACCOUNTS) > 1 ? "🐙 GitHub account: " . esc(github_dest_name($ghDestIdx)) . "\n" : '') .
         "👁 Visibility: " . (($s[$chat]['private'] ?? true) ? '🔒 private' : '🌐 public') . "\n" .
         "🏷 Render service: <code>" . esc($svcName) . "</code>\n" .
         (count($RENDER_ACCOUNTS) > 1 ? "🔀 Render account: " . esc($acctLabel) . "\n" : '') .
@@ -1209,8 +1418,9 @@ function review($chat) {
         rule() . "\n" .
         "<b>What happens when you confirm</b>\n" .
         "1. Copy the template into the new repo\n" .
-        "2. Write these values into <code>" . esc($CONFIG_PATH) . "</code>\n" .
-        "3. Create the Render service and start the first build\n\n" .
+        "2. Verify critical files (like Dockerfile) made it across, and restore any that didn't\n" .
+        "3. Write these values into <code>" . esc($CONFIG_PATH) . "</code>\n" .
+        "4. Create the Render service and start the first build\n\n" .
         "🔒 <i>The template repo is not modified at any point.</i>",
         [[['text' => '✅ Create & deploy', 'callback_data' => 'deploy']],
          [['text' => '🔁 Redo the settings', 'callback_data' => 'redo'],
@@ -1221,7 +1431,7 @@ function review($chat) {
 //  15. BUILD: CLONE → CONFIG → DEPLOY  (with account auto-rotate)
 // ============================================================
 function build_everything($chat) {
-    global $GITHUB_OWNER, $CONFIG_PATH, $RENDER_REGION, $FIELD_ALIASES, $RENDER_ACCOUNTS;
+    global $GITHUB_DEST_ACCOUNTS, $CONFIG_PATH, $RENDER_REGION, $FIELD_ALIASES, $RENDER_ACCOUNTS;
 
     $s      = load_state();
     $src    = $s[$chat]['src_repo']   ?? null;
@@ -1230,6 +1440,8 @@ function build_everything($chat) {
     $priv   = $s[$chat]['private']    ?? true;
     $values = $s[$chat]['values']     ?? [];
     $acctSel = $s[$chat]['acct_sel']  ?? 'auto';
+    $ghDestIdx = $s[$chat]['gh_dest_idx'] ?? 0;
+    $ghOwner   = github_dest_owner($ghDestIdx);
 
     if (!$src || !$name) {
         reset_flow($chat);
@@ -1238,24 +1450,24 @@ function build_everything($chat) {
         return;
     }
 
-    $totalSteps = 3;
+    $totalSteps = 4;
 
-    // ── 1 of 3 · copy the template ───────────────────────────
+    // ── 1 of 4 · copy the template ───────────────────────────
     out($chat, "⏳ <b>Working…</b>  " . bar(1, $totalSteps) . "\n\n🧩 Copying <code>" . esc($src) .
                "</code> → <code>" . esc($name) . "</code>\n<i>This usually takes a few seconds.</i>");
 
     $desc = "Copy of $src — created by deploy bot";
-    [$c, $new, $err] = clone_via_template($src, $GITHUB_OWNER, $name, $priv, $desc);
+    [$c, $new, $err] = clone_via_template($src, $ghOwner, $name, $priv, $desc, $ghDestIdx);
 
     if (!$new) {
         say($chat, "⚠️ Template copy didn't work (<i>" . esc($err) . "</i>).\n" .
                    "🔁 <i>Falling back to a file-by-file copy — this takes a bit longer.</i>");
-        [$c, $new, $err] = clone_via_copy($src, $GITHUB_OWNER, $name, $priv, $branch, $desc);
+        [$c, $new, $err] = clone_via_copy($src, $ghOwner, $name, $priv, $branch, $desc, $ghDestIdx);
     }
     if (!$new) {
         reset_flow($chat);
         say($chat, "❌ <b>Couldn't create the new repo</b>\n\n<code>" . esc($err) . "</code>\n\n" .
-                   "<i>Nothing was created. Run /check to test your GitHub token, then try again.</i>", kb_back());
+                   "<i>Nothing was created. Run /check to test your GitHub tokens, then try again.</i>", kb_back());
         return;
     }
 
@@ -1264,10 +1476,22 @@ function build_everything($chat) {
     say($chat, "✅ <b>Repository created</b>\n📦 <code>" . esc($newFull) . "</code>\n" .
                "🔗 https://github.com/$newFull");
 
-    // ── 2 of 3 · write the config ────────────────────────────
-    say($chat, "⏳ <b>Working…</b>  " . bar(2, $totalSteps) . "\n\n📝 Updating <code>" . esc($CONFIG_PATH) . "</code>");
+    // ── 2 of 4 · verify & repair critical files ──────────────
+    say($chat, "⏳ <b>Working…</b>  " . bar(2, $totalSteps) . "\n\n🩹 Verifying critical files (Dockerfile, etc.)");
+    [$repaired, $stillMissing] = repair_missing_files($src, $branch, $newFull, $newBranch, $ghDestIdx);
+    if ($repaired) {
+        say($chat, "✅ <b>Restored:</b> <code>" . esc(implode(', ', $repaired)) . "</code>\n" .
+                   "<i>These didn't make it through the initial copy — pulled straight from the template.</i>");
+    }
+    if ($stillMissing) {
+        say($chat, "⚠️ <b>Still missing:</b> <code>" . esc(implode(', ', $stillMissing)) . "</code>\n" .
+                   "<i>Not found in the template either — the build may fail until you add these manually.</i>");
+    }
 
-    $file = wait_for_file($newFull, $newBranch, $CONFIG_PATH);
+    // ── 3 of 4 · write the config ─────────────────────────────
+    say($chat, "⏳ <b>Working…</b>  " . bar(3, $totalSteps) . "\n\n📝 Updating <code>" . esc($CONFIG_PATH) . "</code>");
+
+    $file = wait_for_file($newFull, $newBranch, $CONFIG_PATH, $ghDestIdx);
     if (!$file) {
         reset_flow($chat);
         say($chat, "❌ <b>No " . esc($CONFIG_PATH) . " in the new repo</b>\n\n" .
@@ -1291,7 +1515,7 @@ function build_everything($chat) {
         'content' => base64_encode($content),
         'sha'     => $file['sha'],
         'branch'  => $newBranch,
-    ]);
+    ], $ghDestIdx);
     if ($c2 < 200 || $c2 >= 300) {
         reset_flow($chat);
         say($chat, "❌ <b>Couldn't save the config</b> (HTTP " . esc($c2) . ")\n<code>" .
@@ -1308,8 +1532,8 @@ function build_everything($chat) {
         "   <i>Those variables may be named differently in your template.</i>\n";
     say($chat, $msg);
 
-    // ── 3 of 3 · create the Render service, rotating accounts if needed ──
-    say($chat, "⏳ <b>Working…</b>  " . bar(3, $totalSteps) . "\n\n🛠 Creating the Render service");
+    // ── 4 of 4 · create the Render service, rotating accounts if needed ──
+    say($chat, "⏳ <b>Working…</b>  " . bar(4, $totalSteps) . "\n\n🛠 Creating the Render service");
 
     if ($acctSel === 'auto') {
         // Round-robin starting point, then fall through the rest in
@@ -1540,20 +1764,23 @@ function list_services($chat, $page = 0, $acctSel = 0) {
 }
 
 /** Repos this bot created, identified by the description it writes. */
+/** Repos this bot created — browses the DESTINATION account, since that's where copies land. */
+/** Repos this bot created — checks every destination account, since copies can land in any of them. */
 function list_clones($chat) {
+    global $GITHUB_DEST_ACCOUNTS;
     out($chat, "⏳ Looking through your repositories…");
-    [$c, $repos] = gh('GET', '/user/repos?per_page=100&sort=created&affiliation=owner');
-    if ($c !== 200) {
-        say($chat, "❌ <b>Couldn't load your repos</b> (HTTP " . esc($c) . ").", kb_back());
-        return;
-    }
 
     $lines = [];
-    foreach ($repos as $r) {
-        if (stripos($r['description'] ?? '', 'deploy bot') === false) continue;
-        $lock = ($r['private'] ?? false) ? '🔒' : '🌐';
-        $lines[] = "$lock <code>" . esc($r['full_name']) . "</code>";
-        if (count($lines) >= 30) break;
+    foreach ($GITHUB_DEST_ACCOUNTS as $idx => $acct) {
+        [$c, $repos] = gh('GET', '/user/repos?per_page=100&sort=created&affiliation=owner', null, $idx);
+        if ($c !== 200 || !is_array($repos)) continue;
+        foreach ($repos as $r) {
+            if (stripos($r['description'] ?? '', 'deploy bot') === false) continue;
+            $lock = ($r['private'] ?? false) ? '🔒' : '🌐';
+            $tag = count($GITHUB_DEST_ACCOUNTS) > 1 ? "  ·  " . esc($acct['name']) : '';
+            $lines[] = "$lock <code>" . esc($r['full_name']) . "</code>$tag";
+            if (count($lines) >= 40) break 2;
+        }
     }
 
     say($chat, $lines
@@ -1751,7 +1978,7 @@ if ($cb !== null) {
             global $DEFAULT_PRIVATE;
             $s[$chat] = [
                 'step' => 'repo_name', 'src_repo' => $picked['full'], 'src_branch' => $picked['branch'],
-                'private' => $DEFAULT_PRIVATE, 'acct_sel' => 'auto', 'field_idx' => 0, 'values' => [],
+                'private' => $DEFAULT_PRIVATE, 'gh_dest_idx' => 0, 'acct_sel' => 'auto', 'field_idx' => 0, 'values' => [],
                 'service_id' => $s[$chat]['service_id'] ?? null,
                 'service_acct' => $s[$chat]['service_acct'] ?? null,
                 'repo_cache' => $s[$chat]['repo_cache'],
@@ -1768,6 +1995,16 @@ if ($cb !== null) {
         toast($s[$chat]['private'] ? 'Now private' : 'Now public');
         ask_repo_name($chat);
     }
+
+    elseif (strpos($cb, 'setghdest:') === 0) {
+        $idx = (int)substr($cb, 10);
+        $s = load_state();
+        $s[$chat]['gh_dest_idx'] = $idx;
+        save_state($s);
+        toast('Selected ' . github_dest_name($idx));
+        ask_github_dest($chat);
+    }
+    elseif ($cb === 'ghdestdone') { toast(); ask_deploy_account($chat); }
 
     elseif (strpos($cb, 'setacct:') === 0) {
         $sel = substr($cb, 8);
