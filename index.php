@@ -1677,14 +1677,16 @@ function show_logs($chat, $sid = null, $acctIdx = null) {
     $acct = account($acctIdx);
     if (!$acct) { out($chat, "⚠️ That Render account isn't configured anymore.", kb_back()); return; }
 
-    $q = http_build_query([
-        'ownerId' => $acct['owner_id'], 'resource' => [$sid],
-        'limit' => 40, 'direction' => 'backward',
-    ]);
+    // Built by hand: http_build_query() would encode this as resource[0]=…
+    // which Render's API rejects (HTTP 400) — it wants resource[]=… instead.
+    $q = 'ownerId=' . urlencode($acct['owner_id']) . '&resource[]=' . urlencode($sid) .
+         '&limit=40&direction=backward';
     [$c, $logs] = rnd('GET', "/logs?$q", null, $acctIdx);
     if ($c !== 200) {
-        out($chat, "❌ <b>Couldn't fetch the logs</b> (HTTP " . esc($c) . ").\n" .
-                   "<i>Render sometimes rate-limits this — wait a moment and retry.</i>",
+        $detail = is_array($logs) ? substr(json_encode($logs), 0, 200) : substr((string)$logs, 0, 200);
+        out($chat, "❌ <b>Couldn't fetch the logs</b> (HTTP " . esc($c) . ")\n<code>" . esc($detail) . "</code>\n\n" .
+                   "<i>This is Render's actual response, not a guess — if it mentions the service ID or " .
+                   "owner, that's the field to check.</i>",
             [[['text' => '🔄 Try again', 'callback_data' => "act:logs:$acctIdx:$sid"]],
              [['text' => '🏠 Menu', 'callback_data' => 'nav:menu']]]);
         return;
